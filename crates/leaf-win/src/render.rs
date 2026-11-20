@@ -25,6 +25,11 @@ pub const COLOR_DIM: u32 = 0x6B6B6B;
 pub const COLOR_PDF_BG: u32 = 0xE6E6E6;
 pub const COLOR_PLACEHOLDER: u32 = 0xF7F7F7;
 
+/// GPU 렌더 타깃 사용 여부. 설정 파일(§8)이 생기면 `[general] gpu`로 대체한다.
+fn use_gpu() -> bool {
+    std::env::var_os("LEAF_D2D_GPU").is_some_and(|v| v == "1")
+}
+
 pub struct Target {
     pub rt: ID2D1HwndRenderTarget,
     pub text: ID2D1SolidColorBrush,
@@ -124,11 +129,12 @@ impl Renderer {
                 },
                 dpiX: self.dpi,
                 dpiY: self.dpi,
-                // M0 실측 비교용: LEAF_D2D_SOFTWARE=1 이면 WARP/소프트웨어 렌더 타깃
-                r#type: if std::env::var_os("LEAF_D2D_SOFTWARE").is_some() {
-                    D2D1_RENDER_TARGET_TYPE_SOFTWARE
-                } else {
+                // SPEC §12 Q8: 소프트웨어가 기본 (GPU 드라이버 DLL 로딩 비용 회피, G1).
+                // GPU는 설정 `[general] gpu = true`(설정 파일 구현 전까지는 LEAF_D2D_GPU=1)로 켠다.
+                r#type: if use_gpu() {
                     D2D1_RENDER_TARGET_TYPE_DEFAULT
+                } else {
+                    D2D1_RENDER_TARGET_TYPE_SOFTWARE
                 },
                 ..Default::default()
             };
