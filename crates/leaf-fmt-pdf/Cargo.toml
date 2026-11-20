@@ -1,0 +1,11 @@
+[package]
+name = "leaf-fmt-pdf"
+description = "PDF 포맷 — PDFium 래퍼(전용 스레드, 지연 로딩)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+crossbeam-channel.workspace = true
+pdfium-render.workspace = true
