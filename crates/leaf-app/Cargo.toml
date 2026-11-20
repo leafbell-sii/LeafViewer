@@ -1,0 +1,14 @@
+﻿[package]
+name = "leaf-app"
+description = "LeafViewer 실행 파일: 조립, 명령줄"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "leafviewer"
+path = "src/main.rs"
+
+[dependencies]
+leaf-win.workspace = true
