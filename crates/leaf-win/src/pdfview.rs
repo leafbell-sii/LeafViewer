@@ -341,6 +341,7 @@ impl PdfView {
                 ZoomMode::FitPage => "fit-page".into(),
                 ZoomMode::Custom(z) => format!("{z:.4}"),
             },
+            offset: 0,
         }
     }
 

@@ -7,6 +7,8 @@
 use std::cell::{Cell, RefCell};
 use std::ffi::{OsStr, OsString, c_void};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
@@ -17,8 +19,9 @@ use leaf_core::worker::WorkerPool;
 use leaf_doc::Dest;
 use leaf_doc::paged::ZoomMode;
 use leaf_fmt_pdf::{PdfEngine, PdfEvent};
+use leaf_fmt_text::search::Hit;
+use leaf_fmt_text::{LineIndex, TextDoc};
 use windows::Win32::Foundation::*;
-use windows::Win32::Graphics::DirectWrite::IDWriteTextLayout;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::Com::*;
 use windows::Win32::System::DataExchange::{
@@ -38,6 +41,8 @@ use crate::StartOptions;
 use crate::bar::{BAR_HEIGHT_DIP, Bar, BarEvent, BarMode, WM_APP_BAR};
 use crate::pdfview::{self, Cmd, CursorKind, PdfView};
 use crate::render::{self, Renderer, rgb};
+use crate::textload;
+use crate::textview::{self, CopyJob, SearchJob, TextView};
 use crate::tree::{LoadState, Node, TreeModel};
 use crate::util::*;
 
@@ -57,8 +62,6 @@ const TIMER_BENCH: usize = 3;
 const SIDEBAR_DIP: i32 = 280;
 const TABS_DIP: i32 = 30;
 const MARGIN: f32 = 16.0;
-/// M0 텍스트 미리보기 상한. 대용량 처리는 M2(희소 인덱스 + 가상화)에서.
-const TEXT_PREVIEW_LIMIT: u64 = 256 * 1024;
 const LPSTR_TEXTCALLBACKW: PWSTR = PWSTR(-1isize as *mut u16);
 const NO_NODE: isize = -1;
 const WHEEL_STEP: f32 = 60.0;
@@ -78,14 +81,37 @@ enum UiMsg {
         generation: u64,
         result: std::result::Result<LoadedText, String>,
     },
+    TextIndexProgress {
+        generation: u64,
+        frac: f32,
+    },
+    TextIndexed {
+        generation: u64,
+        index: LineIndex,
+        ms: f64,
+    },
+    TextHits {
+        generation: u64,
+        id: u64,
+        hits: Vec<Hit>,
+        done_bytes: usize,
+        finished: bool,
+        capped: bool,
+    },
+    TextCopied {
+        generation: u64,
+        result: std::result::Result<String, String>,
+    },
     Pdf(PdfEvent),
 }
 
 struct LoadedText {
-    text: Vec<u16>,
+    doc: Arc<TextDoc>,
     size: u64,
-    encoding: &'static str,
-    truncated: bool,
+    mapped: bool,
+    /// 작은 파일은 읽는 김에 줄 색인까지 만든다
+    index: Option<LineIndex>,
+    load_ms: f64,
 }
 
 /// 다른 스레드에서 UI 스레드를 깨운다. HWND는 Send가 아니므로 정수로 보관.
@@ -115,17 +141,8 @@ impl Waker {
 enum Content {
     Welcome,
     Message(String),
-    Text(TextView),
+    Text(Box<TextView>),
     Pdf(Box<PdfView>),
-}
-
-struct TextView {
-    text: Vec<u16>,
-    mono: bool,
-    /// (레이아웃 폭, 레이아웃, 높이)
-    layout: Option<(f32, IDWriteTextLayout, f32)>,
-    scroll: f32,
-    vh: f32,
 }
 
 struct DocView {
@@ -138,12 +155,14 @@ struct DocView {
 
 #[derive(Default)]
 struct PaintOutcome {
+    /// 문서를 연 뒤 첫 그리기면 열기 → 첫 화면 시간 (NFR-P03/P04)
+    text_first_paint_ms: Option<f64>,
     cmds: Vec<Cmd>,
     generation: u64,
     status: Option<String>,
 }
 
-type ScrollMetrics = ((f32, f32, f32), (f32, f32, f32));
+type ScrollMetrics = ((f64, f64, f64), (f64, f64, f64));
 /// 마지막으로 설정한 스크롤바 값 (가로 전체·페이지·위치, 세로 전체·페이지·위치)
 type ScrollKey = (i32, i32, i32, i32, i32, i32);
 
@@ -184,6 +203,8 @@ struct App {
     perf_text: RefCell<String>,
     cursor: Cell<CursorKind>,
     scroll_cache: Cell<Option<ScrollKey>>,
+    /// 스크롤바 값 축소 비율 (i32 범위를 넘는 바이트 단위용)
+    scroll_scale: Cell<f64>,
     session: RefCell<Session>,
     session_path: Option<PathBuf>,
     bench: RefCell<Option<Bench>>,
@@ -367,7 +388,8 @@ pub fn run(opts: StartOptions) -> Result<()> {
                 loading: None,
                 info: String::new(),
             }),
-            workers: WorkerPool::new(2),
+            // 폴더 읽기 · 줄 색인 · 찾기가 서로 막지 않도록 3개 (SPEC §4.2: 2–4)
+            workers: WorkerPool::new(3),
             pdf: RefCell::new(PdfEngine::new(opts.pdfium_path, move |ev| {
                 pdf_waker.send(UiMsg::Pdf(ev))
             })),
@@ -380,6 +402,7 @@ pub fn run(opts: StartOptions) -> Result<()> {
             perf_text: RefCell::new(String::new()),
             cursor: Cell::new(CursorKind::Arrow),
             scroll_cache: Cell::new(None),
+            scroll_scale: Cell::new(1.0),
             session: RefCell::new(session),
             session_path,
             bench: RefCell::new(opts.bench_scroll.then(Bench::default)),
@@ -436,7 +459,9 @@ pub fn run(opts: StartOptions) -> Result<()> {
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-            if msg.message == WM_KEYDOWN && app.accelerator(msg.wParam.0 as u16) {
+            if (msg.message == WM_KEYDOWN || msg.message == WM_SYSKEYDOWN)
+                && app.accelerator(msg.wParam.0 as u16, msg.message == WM_SYSKEYDOWN)
+            {
                 continue;
             }
             let _ = TranslateMessage(&msg);
@@ -578,10 +603,23 @@ impl App {
 
     // ───── 키보드 가속기 ─────
 
-    /// 포커스 위치와 상관없이 동작하는 단축키. 처리했으면 true.
-    fn accelerator(&self, vk: u16) -> bool {
+    /// 포커스 위치와 상관없이 동작하는 단축키. 처리했으면 true. `alt`: WM_SYSKEYDOWN
+    fn accelerator(&self, vk: u16, alt: bool) -> bool {
         let ctrl = ctrl_down();
         let vk = VIRTUAL_KEY(vk);
+        if alt {
+            // Alt+Z: 자동 줄바꿈 토글 (FR-T03)
+            if vk.0 == b'Z' as u16
+                && let Content::Text(tv) = &mut self.view.borrow_mut().content
+            {
+                tv.toggle_wrap();
+            } else {
+                return false;
+            }
+            self.scroll_cache.set(None);
+            self.invalidate_doc();
+            return true;
+        }
         match vk {
             _ if ctrl && vk.0 == b'O' as u16 => unsafe {
                 let _ = PostMessageW(
@@ -594,7 +632,7 @@ impl App {
             _ if ctrl && vk.0 == b'F' as u16 => self.show_bar(BarMode::Find),
             _ if ctrl && vk.0 == b'G' as u16 => self.show_bar(BarMode::Goto),
             VK_F3 => {
-                if self.pdf_query().is_some() {
+                if self.doc_query().is_some() {
                     self.find_step(!shift_down());
                 } else {
                     self.show_bar(BarMode::Find);
@@ -605,18 +643,20 @@ impl App {
         true
     }
 
-    // ───── 찾기 / 쪽 이동 막대 ─────
+    // ───── 찾기 / 쪽·줄 이동 막대 ─────
 
     fn show_bar(&self, mode: BarMode) {
-        if !matches!(self.view.borrow().content, Content::Pdf(_)) {
-            self.set_status(1, "찾기·쪽 이동은 PDF에서 지원합니다 (TXT·MD는 M2·M3)");
+        if !matches!(
+            self.view.borrow().content,
+            Content::Pdf(_) | Content::Text(_)
+        ) {
             return;
         }
         let was = self.bar_mode.replace(Some(mode));
         self.bar.set_mode(mode);
         if was != Some(mode) {
             let q = if mode == BarMode::Find {
-                self.pdf_query().unwrap_or_default()
+                self.doc_query().unwrap_or_default()
             } else {
                 String::new()
             };
@@ -644,9 +684,11 @@ impl App {
         }
     }
 
-    fn pdf_query(&self) -> Option<String> {
+    /// 현재 문서의 찾기 검색어
+    fn doc_query(&self) -> Option<String> {
         match &self.view.borrow().content {
             Content::Pdf(pv) => pv.search_query().map(str::to_owned),
+            Content::Text(tv) => tv.search_query().map(str::to_owned),
             _ => None,
         }
     }
@@ -656,6 +698,10 @@ impl App {
             (_, BarEvent::Escape) => {
                 let cmd = match &mut self.view.borrow_mut().content {
                     Content::Pdf(pv) => pv.clear_search(),
+                    Content::Text(tv) => {
+                        tv.clear_search();
+                        None
+                    }
                     _ => None,
                 };
                 self.run_cmds(self.current_pdf_gen(), cmd.into_iter().collect());
@@ -667,18 +713,27 @@ impl App {
             },
             (Some(BarMode::Find), BarEvent::Enter | BarEvent::ShiftEnter) => {
                 let text = self.bar.text();
-                if self.pdf_query().as_deref() != Some(text.trim()) {
+                if self.doc_query().as_deref() != Some(text.trim()) {
                     self.start_search();
                 } else {
                     self.find_step(ev == BarEvent::Enter);
                 }
             }
             (Some(BarMode::Goto), BarEvent::Enter) => {
-                let n: usize = self.bar.text().trim().parse().unwrap_or(0);
-                if let Content::Pdf(pv) = &mut self.view.borrow_mut().content
-                    && n >= 1
-                {
-                    pv.go_page(n - 1);
+                let n: u64 = self.bar.text().trim().parse().unwrap_or(0);
+                let mut msg = None;
+                match &mut self.view.borrow_mut().content {
+                    Content::Pdf(pv) if n >= 1 => pv.go_page(n as usize - 1),
+                    Content::Text(tv) if n >= 1 => {
+                        if !tv.go_line(n) {
+                            msg = Some("줄 색인이 끝나면 줄 이동을 할 수 있습니다");
+                        }
+                    }
+                    _ => {}
+                }
+                if let Some(m) = msg {
+                    self.bar.set_info(m);
+                    return;
                 }
                 self.hide_bar();
                 self.invalidate_doc();
@@ -692,17 +747,27 @@ impl App {
             let _ = KillTimer(Some(self.hwnd), TIMER_FIND);
         }
         let q = self.bar.text();
+        let mut job = None;
         let cmd = match &mut self.view.borrow_mut().content {
             Content::Pdf(pv) => Some(pv.start_search(&q)),
+            Content::Text(tv) => {
+                job = tv.start_search(&q).map(|j| (tv.generation, j));
+                None
+            }
             _ => None,
         };
         self.run_cmds(self.current_pdf_gen(), cmd.into_iter().collect());
+        if let Some((generation, job)) = job {
+            self.spawn_text_search(generation, job);
+        }
         self.invalidate_doc();
     }
 
     fn find_step(&self, forward: bool) {
-        if let Content::Pdf(pv) = &mut self.view.borrow_mut().content {
-            pv.find_step(forward);
+        match &mut self.view.borrow_mut().content {
+            Content::Pdf(pv) => pv.find_step(forward),
+            Content::Text(tv) => tv.find_step(forward),
+            _ => {}
         }
         self.invalidate_doc();
     }
@@ -711,6 +776,103 @@ impl App {
         match &self.view.borrow().content {
             Content::Pdf(pv) => pv.generation,
             _ => 0,
+        }
+    }
+
+    // ───── TXT 워커 작업 ─────
+
+    fn spawn_text_search(&self, generation: u64, job: SearchJob) {
+        let waker = self.waker.clone();
+        self.workers.spawn(move || {
+            let SearchJob {
+                id,
+                doc,
+                query,
+                cancel,
+            } = job;
+            let t = Instant::now();
+            let out = leaf_fmt_text::search::search(
+                &doc,
+                &query,
+                textview::MAX_HITS,
+                &cancel,
+                |hits, done_bytes| {
+                    waker.send(UiMsg::TextHits {
+                        generation,
+                        id,
+                        hits,
+                        done_bytes,
+                        finished: false,
+                        capped: false,
+                    })
+                },
+            );
+            if !out.cancelled {
+                perf::record(
+                    "txt_search_ms",
+                    format!(
+                        "{:.1} hits={} bytes={}",
+                        t.elapsed().as_secs_f64() * 1000.0,
+                        out.hits,
+                        doc.len()
+                    ),
+                );
+                waker.send(UiMsg::TextHits {
+                    generation,
+                    id,
+                    hits: Vec::new(),
+                    done_bytes: doc.len(),
+                    finished: true,
+                    capped: out.capped,
+                });
+            }
+        });
+    }
+
+    fn spawn_text_index(&self, generation: u64, doc: Arc<TextDoc>, cancel: Arc<AtomicBool>) {
+        let waker = self.waker.clone();
+        self.workers.spawn(move || {
+            let t = Instant::now();
+            let len = doc.len().max(1) as f32;
+            let index = LineIndex::build(&doc, &cancel, |done| {
+                waker.send(UiMsg::TextIndexProgress {
+                    generation,
+                    frac: done as f32 / len,
+                })
+            });
+            if let Some(index) = index {
+                let ms = t.elapsed().as_secs_f64() * 1000.0;
+                waker.send(UiMsg::TextIndexed {
+                    generation,
+                    index,
+                    ms,
+                });
+            }
+        });
+    }
+
+    fn run_copy(&self, job: CopyJob) {
+        match job {
+            CopyJob::Ready(s) => self.copy_to_clipboard(&s),
+            CopyJob::TooLarge(n) => self.set_status(
+                1,
+                &format!(
+                    "선택이 너무 큽니다({}). 복사 상한은 {}입니다",
+                    human_size(n as u64),
+                    human_size(textview::COPY_MAX_BYTES as u64)
+                ),
+            ),
+            CopyJob::Background { doc, a, b } => {
+                self.set_status(1, "복사하는 중…");
+                let generation = self.doc_gen.get();
+                let waker = self.waker.clone();
+                self.workers.spawn(move || {
+                    let result = doc
+                        .extract(a, b, textview::COPY_MAX_BYTES)
+                        .map_err(|n| format!("선택이 너무 큽니다({})", human_size(n as u64)));
+                    waker.send(UiMsg::TextCopied { generation, result });
+                });
+            }
         }
     }
 
@@ -1184,6 +1346,7 @@ impl App {
     fn remember_current(&self) {
         let pos = match &self.view.borrow().content {
             Content::Pdf(pv) => Some(pv.position()),
+            Content::Text(tv) => Some(tv.position()),
             _ => None,
         };
         if let Some(pos) = pos {
@@ -1199,6 +1362,7 @@ impl App {
             let v = self.view.borrow();
             match &v.content {
                 Content::Pdf(pv) => Some(pv.path.clone()),
+                Content::Text(tv) => Some(tv.path.clone()),
                 _ => v
                     .loading
                     .as_ref()
@@ -1254,10 +1418,25 @@ impl App {
 
         match ext.as_str() {
             "pdf" => self.pdf.borrow_mut().open(generation, &path),
+            // MD는 M3 전까지 원문을 TXT 보기로 보여 준다
             "txt" | "md" | "markdown" => {
                 let waker = self.waker.clone();
                 self.workers.spawn(move || {
-                    let result = load_text(&path);
+                    let t = Instant::now();
+                    let result = textload::load(&path).map(|l| {
+                        // 작은 파일은 줄 색인까지 바로 (16MB 미만이라 수 ms)
+                        let index = (!l.mapped).then(|| {
+                            LineIndex::build(&l.doc, &AtomicBool::new(false), |_| {})
+                                .unwrap_or_default()
+                        });
+                        LoadedText {
+                            doc: l.doc,
+                            size: l.size,
+                            mapped: l.mapped,
+                            index,
+                            load_ms: t.elapsed().as_secs_f64() * 1000.0,
+                        }
+                    });
                     waker.send(UiMsg::TextLoaded { generation, result });
                 });
             }
@@ -1271,18 +1450,26 @@ impl App {
         }
     }
 
-    /// 문서 내용 교체. PDF를 떠나면 엔진의 문서를 닫고 목차·찾기 막대를 정리한다.
+    /// 문서 내용 교체. PDF를 떠나면 엔진의 문서를 닫고 목차를 정리하며, 문서가 바뀌면 찾기 막대를 닫는다.
     fn set_content(&self, content: Content) {
-        let leaving_pdf = {
+        let (leaving_pdf, old) = {
             let mut v = self.view.borrow_mut();
             let was_pdf = matches!(v.content, Content::Pdf(_));
             let is_pdf = matches!(content, Content::Pdf(_));
-            v.content = content;
-            was_pdf && !is_pdf
+            let old = std::mem::replace(&mut v.content, content);
+            (was_pdf && !is_pdf, old)
         };
+        let leaving_doc = matches!(old, Content::Pdf(_) | Content::Text(_));
+        if let Content::Text(tv) = &old {
+            tv.cancel_all();
+        }
+        // 매핑 해제 등 무거울 수 있는 정리는 빌림 밖에서
+        drop(old);
         if leaving_pdf {
             self.pdf.borrow_mut().close();
             self.fill_outline(&[]);
+        }
+        if leaving_doc {
             self.hide_bar();
         }
         self.scroll_cache.set(None);
@@ -1298,6 +1485,54 @@ impl App {
                     result,
                 } => self.on_dir_listed(generation, node, result),
                 UiMsg::TextLoaded { generation, result } => self.on_text_loaded(generation, result),
+                UiMsg::TextIndexProgress { generation, frac } => {
+                    if let Content::Text(tv) = &mut self.view.borrow_mut().content
+                        && tv.generation == generation
+                    {
+                        tv.set_index_progress(frac);
+                    }
+                    self.invalidate_doc();
+                }
+                UiMsg::TextIndexed {
+                    generation,
+                    index,
+                    ms,
+                } => {
+                    if let Content::Text(tv) = &mut self.view.borrow_mut().content
+                        && tv.generation == generation
+                    {
+                        perf::record(
+                            "txt_index_ms",
+                            format!("{ms:.1} lines={} bytes={}", index.lines, tv.size),
+                        );
+                        tv.set_index(index);
+                    }
+                    self.scroll_cache.set(None);
+                    self.invalidate_doc();
+                }
+                UiMsg::TextHits {
+                    generation,
+                    id,
+                    hits,
+                    done_bytes,
+                    finished,
+                    capped,
+                } => {
+                    if let Content::Text(tv) = &mut self.view.borrow_mut().content
+                        && tv.generation == generation
+                    {
+                        tv.on_search_hits(id, hits, done_bytes, finished, capped);
+                    }
+                    self.invalidate_doc();
+                }
+                UiMsg::TextCopied { generation, result } => {
+                    if generation == self.doc_gen.get() {
+                        match result {
+                            Ok(s) => self.copy_to_clipboard(&s),
+                            Err(e) => self.set_status(1, &e),
+                        }
+                    }
+                }
                 UiMsg::Pdf(ev) => self.on_pdf_event(ev),
             }
         }
@@ -1318,49 +1553,58 @@ impl App {
         let Some((path, started)) = self.take_loading(generation) else {
             return;
         };
-        let (content, status) = match result {
-            Ok(t) => {
-                let mono = !path
-                    .extension()
-                    .is_some_and(|e| e.eq_ignore_ascii_case("md"));
-                let s = format!(
-                    "{} · {} · {}{}",
-                    path.file_name()
-                        .map(|n| n.to_string_lossy())
-                        .unwrap_or_default(),
-                    t.encoding,
-                    human_size(t.size),
-                    if t.truncated {
-                        " · 미리보기(앞 256KB)"
-                    } else {
-                        ""
-                    }
-                );
-                *self.perf_text.borrow_mut() =
-                    format!("로드 {:.0}ms", started.elapsed().as_secs_f64() * 1000.0);
-                (
-                    Content::Text(TextView {
-                        text: t.text,
-                        mono,
-                        layout: None,
-                        scroll: 0.0,
-                        vh: 0.0,
-                    }),
-                    s,
-                )
-            }
-            Err(e) => (
-                Content::Message(format!(
+        let t = match result {
+            Ok(t) => t,
+            Err(e) => {
+                self.set_content(Content::Message(format!(
                     "파일을 열 수 없습니다.\n\n{}\n\n{e}",
                     path.display()
-                )),
-                path.display().to_string(),
-            ),
+                )));
+                self.view.borrow_mut().info.clear();
+                self.set_status(0, &path.display().to_string());
+                return;
+            }
         };
-        self.set_content(content);
-        self.view.borrow_mut().info = status.clone();
-        self.set_status(0, &status);
-        self.set_status(1, &self.perf_text.borrow());
+        perf::record(
+            "txt_load_ms",
+            format!(
+                "{:.2} bytes={} mapped={} enc={}",
+                t.load_ms, t.size, t.mapped, t.doc.enc.label
+            ),
+        );
+        let info = format!(
+            "{} · {} · {}",
+            path.file_name()
+                .map(|n| n.to_string_lossy())
+                .unwrap_or_default(),
+            t.doc.enc.label,
+            human_size(t.size),
+        );
+        let need_index = t.index.is_none();
+        let doc = t.doc.clone();
+        let dwrite = self.view.borrow().renderer.dwrite.clone();
+        let mut tv = TextView::new(
+            generation,
+            path.clone(),
+            t.doc,
+            t.size,
+            t.index,
+            dwrite,
+            started,
+        );
+        if let Some(pos) = self.session.borrow().position_of(&path) {
+            tv.restore(pos);
+        }
+        let cancel = tv.cancel.clone();
+        self.hide_bar();
+        self.set_content(Content::Text(Box::new(tv)));
+        *self.perf_text.borrow_mut() = format!("로드 {:.0}ms", t.load_ms);
+        self.view.borrow_mut().info = info.clone();
+        self.set_status(0, &info);
+        self.session.borrow_mut().open_file = Some(path);
+        if need_index {
+            self.spawn_text_index(generation, doc, cancel);
+        }
     }
 
     fn on_pdf_event(&self, ev: PdfEvent) {
@@ -1536,6 +1780,10 @@ impl App {
             *self.perf_text.borrow_mut() = format!("첫 화면 {ms:.0}ms");
             self.set_status(1, &self.perf_text.borrow());
         }
+        if let Some(ms) = outcome.text_first_paint_ms {
+            perf::record("txt_first_paint_ms", format!("{ms:.2}"));
+            *self.perf_text.borrow_mut() = format!("첫 화면 {ms:.0}ms");
+        }
         self.run_cmds(outcome.generation, outcome.cmds);
         if let Some(s) = outcome.status {
             self.set_status(1, &s);
@@ -1543,6 +1791,7 @@ impl App {
         if self.bar_mode.get() == Some(BarMode::Find) {
             let info = match &self.view.borrow().content {
                 Content::Pdf(pv) => pv.search_status().unwrap_or_default(),
+                Content::Text(tv) => tv.search_status().unwrap_or_default(),
                 _ => String::new(),
             };
             self.bar.set_info(&info);
@@ -1552,12 +1801,15 @@ impl App {
     }
 
     fn scroll_metrics(&self) -> Option<ScrollMetrics> {
-        match &self.view.borrow().content {
-            Content::Pdf(pv) => Some(pv.scroll_metrics()),
-            Content::Text(tv) => tv
-                .layout
-                .as_ref()
-                .map(|(w, _, h)| ((0.0, *w, 0.0), (h + 2.0 * MARGIN, tv.vh, tv.scroll))),
+        match &mut self.view.borrow_mut().content {
+            Content::Pdf(pv) => {
+                let ((a, b, c), (d, e, f)) = pv.scroll_metrics();
+                Some((
+                    (a as f64, b as f64, c as f64),
+                    (d as f64, e as f64, f as f64),
+                ))
+            }
+            Content::Text(tv) => Some(tv.scroll_metrics()),
             _ => None,
         }
     }
@@ -1565,9 +1817,18 @@ impl App {
     /// 표준 스크롤바 갱신. 막대가 생기거나 사라지면 WM_SIZE가 다시 오므로 빌림 없이 호출한다.
     fn update_scrollbars(&self) {
         let m = self.scroll_metrics();
+        // 스크롤바 값은 i32: 큰 값(바이트 단위 등)은 비율을 줄여 넣는다
+        let big = m.map_or(0.0, |((tw, ..), (th, ..))| tw.max(th));
+        let k = if big > 1e9 { big / 1e9 } else { 1.0 };
+        self.scroll_scale.set(k);
         let key = m.map(|((tw, vw, sx), (th, vh, sy))| {
             (
-                tw as i32, vw as i32, sx as i32, th as i32, vh as i32, sy as i32,
+                (tw / k) as i32,
+                (vw / k) as i32,
+                (sx / k) as i32,
+                (th / k) as i32,
+                (vh / k) as i32,
+                (sy / k) as i32,
             )
         });
         if key == self.scroll_cache.get() {
@@ -1580,7 +1841,7 @@ impl App {
         };
         unsafe {
             for (bar, (total, page, pos)) in [(SB_HORZ, h), (SB_VERT, v)] {
-                let show = total > page + 1;
+                let show = total > page;
                 let si = SCROLLINFO {
                     cbSize: size_of::<SCROLLINFO>() as u32,
                     fMask: SIF_RANGE | SIF_PAGE | SIF_POS,
@@ -1595,27 +1856,7 @@ impl App {
         }
     }
 
-    fn scroll_doc(&self, x: Option<f32>, y: Option<f32>) {
-        {
-            let mut v = self.view.borrow_mut();
-            match &mut v.content {
-                Content::Pdf(pv) => pv.scroll_to(x, y),
-                Content::Text(tv) => {
-                    if let Some(y) = y {
-                        tv.scroll = y;
-                    }
-                }
-                _ => return,
-            }
-        }
-        self.invalidate_doc();
-    }
-
     fn on_scrollbar(&self, bar: SCROLLBAR_CONSTANTS, code: u32) {
-        let Some(((_, vw, sx), (_, vh, sy))) = self.scroll_metrics() else {
-            return;
-        };
-        let (page, pos) = if bar == SB_VERT { (vh, sy) } else { (vw, sx) };
         let mut si = SCROLLINFO {
             cbSize: size_of::<SCROLLINFO>() as u32,
             fMask: SIF_TRACKPOS,
@@ -1624,21 +1865,69 @@ impl App {
         unsafe {
             let _ = GetScrollInfo(self.doc, bar, &mut si);
         }
-        let new = match SCROLLBAR_COMMAND(code as i32) {
+        let track = si.nTrackPos as f64 * self.scroll_scale.get();
+        let cmd = SCROLLBAR_COMMAND(code as i32);
+        let is_text = matches!(self.view.borrow().content, Content::Text(_));
+        if is_text {
+            if let Content::Text(tv) = &mut self.view.borrow_mut().content {
+                let (vw, vh) = tv.view_size();
+                let vert = bar == SB_VERT;
+                let step = if vert { 40.0 } else { 32.0 };
+                let page = if vert { vh * 0.9 } else { vw * 0.9 };
+                let d = match cmd {
+                    SB_LINEUP => -step,
+                    SB_LINEDOWN => step,
+                    SB_PAGEUP => -page,
+                    SB_PAGEDOWN => page,
+                    SB_THUMBTRACK | SB_THUMBPOSITION => {
+                        if vert {
+                            tv.scroll_to_unit(track);
+                        } else {
+                            tv.set_sx(track as f32);
+                        }
+                        0.0
+                    }
+                    SB_TOP if vert => {
+                        tv.home();
+                        0.0
+                    }
+                    SB_BOTTOM if vert => {
+                        tv.end();
+                        0.0
+                    }
+                    _ => return,
+                };
+                if vert {
+                    tv.scroll_px(d);
+                } else {
+                    tv.scroll_x(d);
+                }
+            }
+            self.invalidate_doc();
+            return;
+        }
+        let Some(((_, vw, sx), (_, vh, sy))) = self.scroll_metrics() else {
+            return;
+        };
+        let (page, pos) = if bar == SB_VERT { (vh, sy) } else { (vw, sx) };
+        let new = match cmd {
             SB_LINEUP => pos - 40.0,
             SB_LINEDOWN => pos + 40.0,
             SB_PAGEUP => pos - page * 0.9,
             SB_PAGEDOWN => pos + page * 0.9,
-            SB_THUMBTRACK | SB_THUMBPOSITION => si.nTrackPos as f32,
+            SB_THUMBTRACK | SB_THUMBPOSITION => track,
             SB_TOP => 0.0,
-            SB_BOTTOM => f32::MAX,
+            SB_BOTTOM => f32::MAX as f64,
             _ => return,
-        };
-        if bar == SB_VERT {
-            self.scroll_doc(None, Some(new));
-        } else {
-            self.scroll_doc(Some(new), None);
+        } as f32;
+        if let Content::Pdf(pv) = &mut self.view.borrow_mut().content {
+            if bar == SB_VERT {
+                pv.scroll_to(None, Some(new));
+            } else {
+                pv.scroll_to(Some(new), None);
+            }
         }
+        self.invalidate_doc();
     }
 
     fn to_dip(&self, lparam: LPARAM) -> (f32, f32) {
@@ -1662,24 +1951,30 @@ impl App {
                 let _ = ScreenToClient(self.doc, &mut pt);
             }
             let k = 96.0 / self.dpi() as f32;
-            if let Content::Pdf(pv) = &mut self.view.borrow_mut().content {
-                pv.zoom_by(1.1f32.powf(steps), Some((pt.x as f32 * k, pt.y as f32 * k)));
+            match &mut self.view.borrow_mut().content {
+                Content::Pdf(pv) => {
+                    pv.zoom_by(1.1f32.powf(steps), Some((pt.x as f32 * k, pt.y as f32 * k)))
+                }
+                Content::Text(tv) => tv.zoom_by(1.1f32.powf(steps)),
+                _ => {}
             }
             self.invalidate_doc();
             return;
         }
-        let horizontal = horizontal || shift;
+        // WM_MOUSEHWHEEL은 양수가 오른쪽, 세로 휠(Shift 포함)은 양수가 위/왼쪽
         let d = if horizontal {
             steps * WHEEL_STEP
         } else {
             -steps * WHEEL_STEP
         };
+        let horizontal = horizontal || shift;
         {
             let mut v = self.view.borrow_mut();
             match &mut v.content {
                 Content::Pdf(pv) if horizontal => pv.scroll_by(d, 0.0),
                 Content::Pdf(pv) => pv.scroll_by(0.0, d),
-                Content::Text(tv) if !horizontal => tv.scroll += d,
+                Content::Text(tv) if horizontal => tv.scroll_x(d),
+                Content::Text(tv) => tv.scroll_px(d),
                 _ => return,
             }
         }
@@ -1689,6 +1984,7 @@ impl App {
     fn on_doc_key(&self, vk: VIRTUAL_KEY) {
         let ctrl = ctrl_down();
         let mut cmds = Vec::new();
+        let mut copy = None;
         {
             let mut v = self.view.borrow_mut();
             match &mut v.content {
@@ -1710,22 +2006,27 @@ impl App {
                         }
                     }
                 },
-                Content::Text(tv) => {
-                    let view_h = tv.vh;
-                    tv.scroll += match vk {
-                        VK_NEXT | VK_SPACE => view_h * 0.9,
-                        VK_PRIOR => -view_h * 0.9,
-                        VK_DOWN => 40.0,
-                        VK_UP => -40.0,
-                        VK_HOME => -f32::MAX / 4.0,
-                        VK_END => f32::MAX / 4.0,
-                        _ => return,
-                    };
-                }
+                Content::Text(tv) => match vk {
+                    _ if ctrl && vk.0 == b'C' as u16 => copy = tv.copy(),
+                    _ if ctrl && vk.0 == b'A' as u16 => tv.select_all(),
+                    VK_OEM_PLUS | VK_ADD if ctrl => tv.zoom_by(1.1),
+                    VK_OEM_MINUS | VK_SUBTRACT if ctrl => tv.zoom_by(1.0 / 1.1),
+                    _ if ctrl && (vk.0 == b'0' as u16 || vk == VK_NUMPAD0) => tv.set_zoom(1.0),
+                    VK_HOME if ctrl => tv.home(),
+                    VK_END if ctrl => tv.end(),
+                    _ => {
+                        if !tv.on_key(vk.0, shift_down()) {
+                            return;
+                        }
+                    }
+                },
                 _ => return,
             }
         }
         self.run_cmds(self.current_pdf_gen(), cmds);
+        if let Some(job) = copy {
+            self.run_copy(job);
+        }
         self.invalidate_doc();
     }
 
@@ -1734,22 +2035,37 @@ impl App {
         let mut cmds = Vec::new();
         {
             let mut v = self.view.borrow_mut();
-            let Content::Pdf(pv) = &mut v.content else {
-                return;
-            };
-            match msg {
-                WM_LBUTTONDOWN => pv.on_mouse_down(x, y, shift_down()),
-                WM_MOUSEMOVE => {
-                    let dragging = wparam.0 & 0x0001 != 0; // MK_LBUTTON
-                    let c = pv.on_mouse_move(x, y, dragging);
-                    self.cursor.set(c);
-                    if !dragging {
-                        drop(v);
-                        self.apply_cursor();
-                        return;
+            match &mut v.content {
+                Content::Pdf(pv) => match msg {
+                    WM_LBUTTONDOWN => pv.on_mouse_down(x, y, shift_down()),
+                    WM_MOUSEMOVE => {
+                        let dragging = wparam.0 & 0x0001 != 0; // MK_LBUTTON
+                        let c = pv.on_mouse_move(x, y, dragging);
+                        self.cursor.set(c);
+                        if !dragging {
+                            drop(v);
+                            self.apply_cursor();
+                            return;
+                        }
                     }
-                }
-                WM_LBUTTONUP => cmds.extend(pv.on_mouse_up()),
+                    WM_LBUTTONUP => cmds.extend(pv.on_mouse_up()),
+                    _ => return,
+                },
+                Content::Text(tv) => match msg {
+                    WM_LBUTTONDOWN => tv.on_mouse_down(x, y, shift_down()),
+                    WM_MOUSEMOVE => {
+                        let dragging = wparam.0 & 0x0001 != 0;
+                        let c = tv.on_mouse_move(x, y, dragging);
+                        self.cursor.set(c);
+                        if !dragging {
+                            drop(v);
+                            self.apply_cursor();
+                            return;
+                        }
+                    }
+                    WM_LBUTTONUP => {}
+                    _ => return,
+                },
                 _ => return,
             }
         }
@@ -1773,8 +2089,11 @@ impl App {
     // ───── 스크롤 벤치마크 (NFR-P07, `--bench-scroll`) ─────
 
     fn maybe_start_bench(&self) {
-        let ready =
-            matches!(&self.view.borrow().content, Content::Pdf(pv) if pv.first_page_shown());
+        let ready = match &self.view.borrow().content {
+            Content::Pdf(pv) => pv.first_page_shown(),
+            Content::Text(tv) => tv.first_paint_ms.is_some(),
+            _ => false,
+        };
         let mut b = self.bench.borrow_mut();
         if let Some(b) = b.as_mut()
             && ready
@@ -1794,6 +2113,10 @@ impl App {
                 Content::Pdf(pv) => {
                     pv.scroll_by(0.0, BENCH_STEP);
                     pv.at_end()
+                }
+                Content::Text(tv) => {
+                    tv.scroll_px(BENCH_STEP);
+                    tv.at_end()
                 }
                 _ => true,
             }
@@ -1873,33 +2196,15 @@ fn view_size(r: &Renderer, hwnd: HWND) -> (f32, f32) {
 const WELCOME_TITLE: &str = "LeafViewer";
 const WELCOME_BODY: &str = "폴더를 열려면 Ctrl+O를 누르거나 탐색기에서 폴더를 끌어다 놓으세요.\n\
 트리에서 ↑↓로 이동하면 바로 미리 봅니다.\n\n\
-PDF: 휠·PgUp/PgDn·Space로 넘기기 · Ctrl+휠, Ctrl +/-로 확대 · Ctrl+0 폭 맞춤 · Ctrl+1 실제 크기 · Ctrl+2 쪽 맞춤\n\
-Ctrl+F 찾기 (Enter/F3 다음, Shift+Enter/Shift+F3 이전) · Ctrl+G 쪽 이동 · 끌어서 선택 후 Ctrl+C 복사 · Ctrl+A 전체 선택\n\
-사이드바의 \"목차\" 탭에서 책갈피로 이동합니다.";
+공통: Ctrl+F 찾기 (Enter/F3 다음, Shift+Enter/Shift+F3 이전) · 끌어서 선택 후 Ctrl+C 복사 · Ctrl+A 전체 선택 · Ctrl+휠, Ctrl +/- 확대\n\
+PDF: 휠·PgUp/PgDn·Space로 넘기기 · Ctrl+0 폭 맞춤 · Ctrl+1 실제 크기 · Ctrl+2 쪽 맞춤 · Ctrl+G 쪽 이동 · 사이드바 \"목차\" 탭\n\
+TXT: Alt+Z 자동 줄바꿈 켜기/끄기 · Ctrl+G 줄 이동 · Ctrl+0 기본 배율 · Ctrl+Home/End 처음/끝";
 
 fn paint(v: &mut DocView, hwnd: HWND) -> Result<PaintOutcome> {
     let mut out = PaintOutcome::default();
     let (vw, vh) = view_size(&v.renderer, hwnd);
     let dpi = v.renderer.dpi();
 
-    // 텍스트 레이아웃(폭이 바뀌었을 때만 재생성)
-    if let Content::Text(tv) = &mut v.content {
-        let w = (vw - 2.0 * MARGIN).max(50.0);
-        if tv
-            .layout
-            .as_ref()
-            .is_none_or(|(lw, ..)| (lw - w).abs() > 0.5)
-        {
-            let fmt = if tv.mono {
-                &v.renderer.mono
-            } else {
-                &v.renderer.body
-            };
-            let (layout, h) = v.renderer.layout(&tv.text, fmt, w)?;
-            tv.layout = Some((w, layout, h));
-        }
-        tv.vh = vh;
-    }
     let welcome = if matches!(v.content, Content::Welcome | Content::Message(_)) {
         let (title, body) = match &v.content {
             Content::Message(m) => (None, m.as_str()),
@@ -1943,10 +2248,16 @@ fn paint(v: &mut DocView, hwnd: HWND) -> Result<PaintOutcome> {
             }
             Content::Text(tv) => {
                 t.rt.Clear(Some(&rgb(render::COLOR_BG)));
-                let (_, layout, h) = tv.layout.as_ref().unwrap();
-                let max_scroll = (h + 2.0 * MARGIN - vh).max(0.0);
-                tv.scroll = tv.scroll.clamp(0.0, max_scroll);
-                render::draw_layout(t, layout, MARGIN, MARGIN - tv.scroll, &t.text);
+                tv.set_view(vw, vh);
+                let first = tv.first_paint_ms.is_none();
+                let r = tv.paint(t);
+                if first {
+                    out.text_first_paint_ms = tv.first_paint_ms;
+                }
+                out.status = Some(match r {
+                    Ok(()) => tv.status(),
+                    Err(e) => format!("그리기 오류: {e}"),
+                });
             }
             Content::Pdf(pv) => {
                 pv.set_view(vw, vh, dpi);
@@ -1959,64 +2270,6 @@ fn paint(v: &mut DocView, hwnd: HWND) -> Result<PaintOutcome> {
     }
     v.renderer.end_draw()?;
     Ok(out)
-}
-
-/// M0 텍스트 미리보기: BOM → UTF-8 → (실패 시) 손실 변환. 정식 인코딩 감지는 M2 (FR-T01).
-fn load_text(path: &Path) -> std::result::Result<LoadedText, String> {
-    use std::io::Read;
-    let f = std::fs::File::open(path).map_err(|e| e.to_string())?;
-    let size = f.metadata().map(|m| m.len()).unwrap_or(0);
-    let mut buf = Vec::new();
-    f.take(TEXT_PREVIEW_LIMIT)
-        .read_to_end(&mut buf)
-        .map_err(|e| e.to_string())?;
-    let truncated = size > TEXT_PREVIEW_LIMIT;
-    let (text, encoding): (Vec<u16>, &'static str) =
-        if let Some(rest) = buf.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
-            (
-                String::from_utf8_lossy(rest).encode_utf16().collect(),
-                "UTF-8 BOM",
-            )
-        } else if let Some(rest) = buf.strip_prefix(&[0xFF, 0xFE]) {
-            (
-                rest.as_chunks::<2>()
-                    .0
-                    .iter()
-                    .map(|c| u16::from_le_bytes(*c))
-                    .collect(),
-                "UTF-16 LE",
-            )
-        } else if let Some(rest) = buf.strip_prefix(&[0xFE, 0xFF]) {
-            (
-                rest.as_chunks::<2>()
-                    .0
-                    .iter()
-                    .map(|c| u16::from_be_bytes(*c))
-                    .collect(),
-                "UTF-16 BE",
-            )
-        } else {
-            match std::str::from_utf8(&buf) {
-                Ok(s) => (s.encode_utf16().collect(), "UTF-8"),
-                // 잘린 끝의 불완전한 UTF-8 시퀀스는 정상으로 본다
-                Err(e) if truncated && e.error_len().is_none() => (
-                    String::from_utf8_lossy(&buf[..e.valid_up_to()])
-                        .encode_utf16()
-                        .collect(),
-                    "UTF-8",
-                ),
-                Err(_) => (
-                    String::from_utf8_lossy(&buf).encode_utf16().collect(),
-                    "UTF-8(손실)",
-                ),
-            }
-        };
-    Ok(LoadedText {
-        text,
-        size,
-        encoding,
-        truncated,
-    })
 }
 
 // ───────────────────────── 창 프로시저 ─────────────────────────
@@ -2147,8 +2400,10 @@ extern "system" fn doc_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                 if w == 0 || h == 0 {
                     // 최소화: 디바이스 리소스와 비트맵 캐시를 비운다 (SPEC §4.5)
                     v.renderer.discard_target();
-                    if let Content::Pdf(pv) = &mut v.content {
-                        pv.release_bitmaps();
+                    match &mut v.content {
+                        Content::Pdf(pv) => pv.release_bitmaps(),
+                        Content::Text(tv) => tv.release(),
+                        _ => {}
                     }
                 } else {
                     v.renderer.resize(w, h);

@@ -37,6 +37,8 @@ pub struct FilePos {
     pub y_pt: f32,
     /// "fit-width" | "fit-page" | 배율(1.0 = 100%)
     pub zoom: String,
+    /// TXT: 화면 맨 위 행의 파일 바이트 오프셋 (이때 `y_pt`는 그 행 안의 DIP)
+    pub offset: u64,
 }
 
 pub fn default_path() -> Option<PathBuf> {
@@ -106,6 +108,7 @@ mod tests {
                 page: i as u32,
                 y_pt: 1.5,
                 zoom: "fit-width".into(),
+                offset: i as u64,
             });
         }
         s.remember(FilePos {
