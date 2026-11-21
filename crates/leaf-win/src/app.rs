@@ -1,20 +1,25 @@
-//! 메인 창, 사이드바(파일 트리 / 목차 탭), 찾기 막대, 문서 영역(D2D 자식 창).
+//! 메인 창, 사이드바(파일 트리 / 목차 탭), 찾기 막대, 문서 영역(D2D 자식 창), 상태 표시줄.
 //!
-//! 재진입 규칙: 창 프로시저는 컨트롤에 메시지를 보내는 동안 다시 호출될 수 있다(WM_NOTIFY 등).
-//! 그래서 `App`의 상태는 필드별 `Cell`/`RefCell`로 나누고, **컨트롤에 SendMessage 하는 동안에는
-//! 어떤 RefCell 빌림도 들고 있지 않는다.** PDF 보기는 요청을 `Cmd`로 돌려주고, 빌림을 놓은 뒤 처리한다.
+//! 재진입 규칙: 창 프로시저는 컨트롤에 메시지를 보내는 동안 다시 호출될 수 있다(WM_SIZE 등).
+//! 그래서 `App`의 상태는 필드별 `Cell`/`RefCell`로 나누고, **다른 창에 SendMessage 하는 동안에는
+//! 어떤 RefCell 빌림도 들고 있지 않는다.** 보기들은 요청을 `Cmd`로 돌려주고, 빌림을 놓은 뒤 처리한다.
+//! 창 프로시저의 패닉은 잡아서 오류 화면으로 바꾼다 (FR-V07, §6.2).
 
 use std::cell::{Cell, RefCell};
 use std::ffi::{OsStr, OsString, c_void};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
+use leaf_core::config::{self, Config, Theme, ZoomSetting};
 use leaf_core::fs_tree::{self, Entry, ListOptions};
 use leaf_core::perf;
-use leaf_core::session::{self, Session, WindowState};
+use leaf_core::session::{self, FilePos, Session, WindowState};
+use leaf_core::tree::{LoadState, TreeModel, VisRow};
+use leaf_core::watch::{WatchEvent, Watcher};
 use leaf_core::worker::WorkerPool;
 use leaf_doc::Dest;
 use leaf_doc::paged::ZoomMode;
@@ -25,51 +30,61 @@ use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::Com::*;
 use windows::Win32::System::DataExchange::{
-    CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+    COPYDATASTRUCT, CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
 use windows::Win32::System::Ole::CF_UNICODETEXT;
-use windows::Win32::UI::Controls::*;
+use windows::Win32::System::Threading::CreateMutexW;
+use windows::Win32::UI::Controls::SetScrollInfo;
 use windows::Win32::UI::HiDpi::{GetDpiForWindow, SystemParametersInfoForDpi};
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::core::{PCWSTR, PWSTR, Result, w};
+use windows::core::{PCWSTR, Result, w};
 
 use crate::StartOptions;
 use crate::bar::{BAR_HEIGHT_DIP, Bar, BarEvent, BarMode, WM_APP_BAR};
+use crate::chrome::{self, Strip, StripKind, WM_APP_TAB};
 use crate::mdload::{self, DecodedImage, LoadedMd};
-use crate::mdview::{MdCmd, MdView};
+use crate::mdview::{MdCmd, MdStyle, MdView};
 use crate::pdfview::{self, Cmd, CursorKind, PdfView};
 use crate::render::{self, Renderer, rgb};
 use crate::textload;
-use crate::textview::{self, CopyJob, SearchJob, TextView};
-use crate::tree::{LoadState, Node, TreeModel};
+use crate::textview::{self, CopyJob, SearchJob, TextStyle, TextView};
+use crate::theme;
+use crate::treelist::{self, Fonts, Icon, ListEvent, ListState, Row};
 use crate::util::*;
 
 const MAIN_CLASS: PCWSTR = w!("LeafViewer.Main");
 const DOC_CLASS: PCWSTR = w!("LeafViewer.Doc");
 
 const WM_APP_WAKE: u32 = WM_APP + 1;
-const ID_TREE: usize = 100;
-const ID_STATUS: usize = 101;
-const ID_TABS: usize = 102;
-const ID_OUTLINE: usize = 103;
+/// 창 프로시저에서 잡은 패닉을 복구한다
+const WM_APP_PANIC: u32 = WM_APP + 4;
 const ID_OPEN_FOLDER: usize = 200;
 const TIMER_SELECT: usize = 1;
 const TIMER_FIND: usize = 2;
 const TIMER_BENCH: usize = 3;
+const TIMER_WATCH: usize = 4;
 
+/// 사이드바 기본·최소 폭(DIP), 탭 줄·상태 표시줄 높이, 끌어서 폭을 바꾸는 틈
 const SIDEBAR_DIP: i32 = 280;
-const TABS_DIP: i32 = 30;
+const SIDEBAR_MIN_DIP: i32 = 140;
+const TABS_DIP: i32 = 32;
+const STATUS_DIP: i32 = 24;
+const SPLIT_DIP: i32 = 4;
 const MARGIN: f32 = 16.0;
-const LPSTR_TEXTCALLBACKW: PWSTR = PWSTR(-1isize as *mut u16);
-const NO_NODE: isize = -1;
 const WHEEL_STEP: f32 = 60.0;
 /// 스크롤 벤치마크: 틱마다 내리는 양(DIP)과 최대 틱 수
 const BENCH_STEP: f32 = 40.0;
 const BENCH_MAX_TICKS: usize = 600;
+/// 파일 감시 이벤트를 모으는 시간 (FR-F05: 200ms 디바운스)
+const WATCH_DEBOUNCE_MS: u32 = 200;
+/// 뒤로/앞으로 기록 최대 개수 (FR-V02)
+const HISTORY_MAX: usize = 100;
+/// 단일 인스턴스: 두 번째 실행이 기존 창에 경로를 넘길 때 WM_COPYDATA 식별자 (FR-A06)
+const COPYDATA_OPEN: usize = 0x4C56_4F50;
 
 // ───────────────────────── 워커 → UI 메시지 ─────────────────────────
 
@@ -115,15 +130,27 @@ enum UiMsg {
         id: u32,
         result: std::result::Result<DecodedImage, String>,
     },
+    Watch(WatchEvent),
 }
 
 /// MD를 어떻게 열지 (FR-M06, FR-M09)
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MdMode {
-    /// 렌더링 상한(8MB) 이하면 렌더링, 넘으면 원문
+    /// 렌더링 상한(기본 8MB) 이하면 렌더링, 넘으면 원문
     Auto,
     Raw,
     Render,
+}
+
+/// 문서를 여는 이유
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OpenKind {
+    /// 트리 선택·링크·끌어다 놓기 → 뒤로 가기 기록에 남긴다
+    Navigate,
+    /// 같은 문서 다시 읽기(F5·파일 감시·설정 변경·Ctrl+U)
+    Reload,
+    /// 뒤로/앞으로
+    History,
 }
 
 struct LoadedText {
@@ -157,10 +184,55 @@ impl Waker {
     }
 }
 
+/// 워커 작업의 패닉을 오류로 바꾼다 — 패닉이 나도 "여는 중…"에 멈추지 않는다 (FR-V07, §6.2)
+fn guarded<T>(
+    f: impl FnOnce() -> std::result::Result<T, String>,
+) -> std::result::Result<T, String> {
+    catch_unwind(AssertUnwindSafe(f))
+        .unwrap_or_else(|p| Err(format!("내부 오류: {}", panic_text(&*p))))
+}
+
+fn panic_text(p: &(dyn std::any::Any + Send)) -> String {
+    p.downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| p.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "알 수 없는 패닉".into())
+}
+
+fn log_dir() -> Option<PathBuf> {
+    std::env::var_os("LOCALAPPDATA").map(|p| PathBuf::from(p).join("LeafViewer").join("logs"))
+}
+
+/// 패닉을 `logs\crash.log`에 남긴다 (§6.2). GUI 앱이라 콘솔이 없다.
+fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let Some(dir) = log_dir() else { return };
+        let _ = std::fs::create_dir_all(&dir);
+        let secs = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let line = format!(
+            "unix={secs} pid={} thread={} {info}\n",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("?")
+        );
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("crash.log"))
+        {
+            let _ = f.write_all(line.as_bytes());
+        }
+    }));
+}
+
 // ───────────────────────── 문서 영역 상태 ─────────────────────────
 
 enum Content {
     Welcome,
+    /// 오류·안내 화면. 첫 줄과 본문을 빈 줄로 나누면 첫 줄을 제목으로 그린다
     Message(String),
     Text(Box<TextView>),
     Pdf(Box<PdfView>),
@@ -200,25 +272,68 @@ struct Bench {
     started: Option<Instant>,
 }
 
+/// 뒤로/앞으로 (FR-V02): 문서와 위치를 함께 기억한다
+#[derive(Default)]
+struct History {
+    back: Vec<FilePos>,
+    fwd: Vec<FilePos>,
+}
+
+impl History {
+    fn push(&mut self, pos: FilePos) {
+        self.back.push(pos);
+        if self.back.len() > HISTORY_MAX {
+            self.back.remove(0);
+        }
+        self.fwd.clear();
+    }
+}
+
+/// 파일 감시로 모은 변경 (디바운스 동안)
+#[derive(Default)]
+struct WatchDirty {
+    paths: Vec<PathBuf>,
+    rescan: bool,
+    timer: bool,
+}
+
+/// 사이드바의 가상 트리 목록 하나
+struct List {
+    hwnd: HWND,
+    st: RefCell<ListState>,
+}
+
+/// 목차 (FR-P07, FR-M07): 평탄화한 항목과 펼침 상태
+#[derive(Default)]
+struct Outline {
+    items: Vec<(usize, String, Option<Dest>)>,
+    expanded: Vec<bool>,
+    current: Option<usize>,
+}
+
 // ───────────────────────── 앱 ─────────────────────────
 
 struct App {
     hwnd: HWND,
-    tabs: HWND,
-    tree: HWND,
-    outline: HWND,
-    status: HWND,
+    tabs: Strip,
+    status: Strip,
+    files: List,
+    outline: List,
     doc: HWND,
     bar: Bar,
     bar_mode: Cell<Option<BarMode>>,
-    font: Cell<HFONT>,
+    fonts: RefCell<Fonts>,
+    active_tab: Cell<usize>,
     model: RefCell<TreeModel>,
-    outline_dests: RefCell<Vec<Option<Dest>>>,
-    /// 목차 항목 (평탄화 순서) — MD 현재 위치 강조용
-    outline_items: RefCell<Vec<HTREEITEM>>,
-    outline_current: Cell<Option<usize>>,
+    outline_data: RefCell<Outline>,
     /// 링크로 다른 MD를 열 때 열린 뒤 이동할 앵커 (경로, 앵커)
     pending_anchor: RefCell<Option<(PathBuf, String)>>,
+    /// 뒤로/앞으로로 열 때 복원할 위치
+    pending_pos: RefCell<Option<FilePos>>,
+    /// 트리에서 찾아가 선택할 파일 (폴더를 펼치며 찾아간다)
+    pending_reveal: RefCell<Option<PathBuf>>,
+    /// 세션에서 복원할 펼친 폴더
+    pending_expand: RefCell<Vec<PathBuf>>,
     /// MD를 원문/렌더링 중 어느 쪽으로 열지 (Ctrl+U, 큰 MD)
     md_mode: Cell<MdMode>,
     view: RefCell<DocView>,
@@ -227,8 +342,8 @@ struct App {
     waker: Waker,
     rx: Receiver<UiMsg>,
     doc_gen: Cell<u64>,
-    /// 트리를 펼치며 찾아갈 경로: (지금 읽기를 기다리는 노드, 남은 경로 조각)
-    pending_select: RefCell<Option<(usize, Vec<OsString>)>>,
+    /// 지금 문서 파일의 (크기, 수정 시각) — 감시 이벤트가 실제 변경인지 확인
+    doc_stamp: Cell<Option<(u64, SystemTime)>>,
     pending_open: Cell<Option<usize>>,
     first_paint_logged: Cell<bool>,
     perf_text: RefCell<String>,
@@ -238,6 +353,17 @@ struct App {
     scroll_scale: Cell<f64>,
     session: RefCell<Session>,
     session_path: Option<PathBuf>,
+    config: RefCell<Config>,
+    config_path: Option<PathBuf>,
+    /// 트리에 지원하지 않는 파일도 보일지 (설정값으로 시작, 우클릭 메뉴로 전환)
+    show_all: Cell<bool>,
+    watcher: RefCell<Watcher>,
+    watch_dirty: RefCell<WatchDirty>,
+    history: RefCell<History>,
+    sidebar_w: Cell<i32>,
+    sidebar_hidden: Cell<bool>,
+    /// 사이드바 폭을 끄는 중: 누른 지점과 사이드바 오른쪽 끝의 차이(px)
+    split_drag: Cell<Option<i32>>,
     bench: RefCell<Option<Bench>>,
 }
 
@@ -254,7 +380,6 @@ fn create_child(
     class: PCWSTR,
     style: WINDOW_STYLE,
     parent: HWND,
-    id: usize,
     hinst: HINSTANCE,
 ) -> Result<HWND> {
     unsafe {
@@ -268,32 +393,67 @@ fn create_child(
             0,
             0,
             Some(parent),
-            Some(HMENU(id as *mut c_void)),
+            None,
             Some(hinst),
             None,
         )
     }
 }
 
-fn tree_style() -> WINDOW_STYLE {
-    WS_TABSTOP
-        | WINDOW_STYLE(
-            TVS_HASBUTTONS
-                | TVS_LINESATROOT
-                | TVS_SHOWSELALWAYS
-                | TVS_FULLROWSELECT
-                | TVS_TRACKSELECT,
-        )
+/// 단일 인스턴스 (FR-A06): 이미 떠 있는 창이 있으면 경로를 넘기고 true
+fn hand_off_to_running(path: Option<&Path>) -> bool {
+    unsafe {
+        let _mutex = CreateMutexW(None, false, w!("Local\\LeafViewer.SingleInstance"));
+        if GetLastError() != ERROR_ALREADY_EXISTS {
+            // 핸들은 프로세스가 끝날 때까지 들고 있는다 (닫으면 다음 실행이 못 알아본다)
+            std::mem::forget(_mutex);
+            return false;
+        }
+        let Ok(hwnd) = FindWindowW(MAIN_CLASS, None) else {
+            return false;
+        };
+        let text: Vec<u16> = path
+            .map(|p| {
+                std::path::absolute(p)
+                    .unwrap_or_else(|_| p.to_path_buf())
+                    .as_os_str()
+                    .to_string_lossy()
+                    .encode_utf16()
+                    .collect()
+            })
+            .unwrap_or_default();
+        let cds = COPYDATASTRUCT {
+            dwData: COPYDATA_OPEN,
+            cbData: (text.len() * 2) as u32,
+            lpData: text.as_ptr() as *mut c_void,
+        };
+        if IsIconic(hwnd).as_bool() {
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+        }
+        let _ = SetForegroundWindow(hwnd);
+        SendMessageW(
+            hwnd,
+            WM_COPYDATA,
+            None,
+            Some(LPARAM(&cds as *const _ as isize)),
+        );
+        true
+    }
 }
 
 pub fn run(opts: StartOptions) -> Result<()> {
+    install_panic_hook();
+    let config_path = config::default_path();
+    let (cfg, cfg_err) = config_path.as_deref().map(Config::load).unwrap_or_default();
+    if cfg.general.single_instance
+        && !opts.new_instance
+        && !opts.bench_scroll
+        && hand_off_to_running(opts.path.as_deref())
+    {
+        return Ok(());
+    }
     unsafe {
         CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE).ok()?;
-        let icc = INITCOMMONCONTROLSEX {
-            dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32,
-            dwICC: ICC_TREEVIEW_CLASSES | ICC_BAR_CLASSES | ICC_TAB_CLASSES | ICC_STANDARD_CLASSES,
-        };
-        let _ = InitCommonControlsEx(&icc);
 
         let hinst: HINSTANCE = GetModuleHandleW(None)?.into();
         let cursor = LoadCursorW(None, IDC_ARROW)?;
@@ -302,7 +462,6 @@ pub fn run(opts: StartOptions) -> Result<()> {
             lpfnWndProc: Some(main_proc),
             hInstance: hinst,
             hCursor: cursor,
-            hbrBackground: HBRUSH((COLOR_BTNFACE.0 + 1) as usize as *mut c_void),
             lpszClassName: MAIN_CLASS,
             ..Default::default()
         });
@@ -315,6 +474,16 @@ pub fn run(opts: StartOptions) -> Result<()> {
             lpszClassName: DOC_CLASS,
             ..Default::default()
         });
+        RegisterClassExW(&WNDCLASSEXW {
+            cbSize: size_of::<WNDCLASSEXW>() as u32,
+            style: CS_DBLCLKS,
+            lpfnWndProc: Some(list_proc),
+            hInstance: hinst,
+            hCursor: cursor,
+            lpszClassName: treelist::LIST_CLASS,
+            ..Default::default()
+        });
+        chrome::register(hinst)?;
 
         let hwnd = CreateWindowExW(
             WS_EX_ACCEPTFILES,
@@ -341,52 +510,16 @@ pub fn run(opts: StartOptions) -> Result<()> {
             SWP_NOMOVE | SWP_NOZORDER,
         );
 
-        let tabs = create_child(
-            WC_TABCONTROLW,
-            WS_VISIBLE | WS_CLIPSIBLINGS,
+        let tabs = Strip::create(hwnd, hinst, StripKind::Tabs, &["파일", "목차"])?;
+        let files = create_child(
+            treelist::LIST_CLASS,
+            WS_VISIBLE | WS_VSCROLL | WS_TABSTOP,
             hwnd,
-            ID_TABS,
             hinst,
         )?;
-        for (i, label) in ["파일", "목차"].iter().enumerate() {
-            let mut text = wide(label);
-            let item = TCITEMW {
-                mask: TCIF_TEXT,
-                pszText: PWSTR(text.as_mut_ptr()),
-                ..Default::default()
-            };
-            SendMessageW(
-                tabs,
-                TCM_INSERTITEMW,
-                Some(WPARAM(i)),
-                Some(LPARAM(&item as *const _ as isize)),
-            );
-        }
-        let tree = create_child(
-            WC_TREEVIEWW,
-            WS_VISIBLE | tree_style(),
-            hwnd,
-            ID_TREE,
-            hinst,
-        )?;
-        let outline = create_child(WC_TREEVIEWW, tree_style(), hwnd, ID_OUTLINE, hinst)?;
-        for t in [tree, outline] {
-            let _ = SetWindowTheme(t, w!("Explorer"), None);
-            SendMessageW(
-                t,
-                TVM_SETEXTENDEDSTYLE,
-                Some(WPARAM(TVS_EX_DOUBLEBUFFER as usize)),
-                Some(LPARAM(TVS_EX_DOUBLEBUFFER as isize)),
-            );
-        }
-        let status = create_child(
-            STATUSCLASSNAMEW,
-            WS_VISIBLE | WINDOW_STYLE(SBARS_SIZEGRIP),
-            hwnd,
-            ID_STATUS,
-            hinst,
-        )?;
-        let doc = create_child(DOC_CLASS, WS_VISIBLE | WS_TABSTOP, hwnd, 0, hinst)?;
+        let outline = create_child(treelist::LIST_CLASS, WS_VSCROLL | WS_TABSTOP, hwnd, hinst)?;
+        let status = Strip::create(hwnd, hinst, StripKind::Status, &["", ""])?;
+        let doc = create_child(DOC_CLASS, WS_VISIBLE | WS_TABSTOP, hwnd, hinst)?;
         let bar = Bar::create(hwnd, hinst)?;
 
         let session_path = session::default_path();
@@ -401,55 +534,91 @@ pub fn run(opts: StartOptions) -> Result<()> {
             hwnd: hwnd.0 as usize,
         };
         let pdf_waker = waker.clone();
+        let watch_waker = waker.clone();
+        let pdfium_path = if cfg.pdf.pdfium_path.trim().is_empty() {
+            opts.pdfium_path
+        } else {
+            PathBuf::from(cfg.pdf.pdfium_path.trim())
+        };
         let app = Box::new(App {
             hwnd,
             tabs,
-            tree,
-            outline,
             status,
+            files: List {
+                hwnd: files,
+                st: RefCell::new(ListState::new(files)),
+            },
+            outline: List {
+                hwnd: outline,
+                st: RefCell::new(ListState::new(outline)),
+            },
             doc,
             bar,
             bar_mode: Cell::new(None),
-            font: Cell::new(HFONT::default()),
+            fonts: RefCell::new(Fonts {
+                text: HFONT::default(),
+                icon: HFONT::default(),
+            }),
+            active_tab: Cell::new(0),
             model: RefCell::new(TreeModel::default()),
-            outline_dests: RefCell::new(Vec::new()),
-            outline_items: RefCell::new(Vec::new()),
-            outline_current: Cell::new(None),
+            outline_data: RefCell::new(Outline::default()),
             pending_anchor: RefCell::new(None),
+            pending_pos: RefCell::new(None),
+            pending_reveal: RefCell::new(None),
+            pending_expand: RefCell::new(session.expanded.clone()),
             md_mode: Cell::new(MdMode::Auto),
             view: RefCell::new(DocView {
-                renderer: Renderer::new(dpi)?,
+                renderer: Renderer::new(dpi, cfg.general.gpu)?,
                 content: Content::Welcome,
                 loading: None,
                 info: String::new(),
             }),
             // 폴더 읽기 · 줄 색인 · 찾기가 서로 막지 않도록 3개 (SPEC §4.2: 2–4)
             workers: WorkerPool::new(3),
-            pdf: RefCell::new(PdfEngine::new(opts.pdfium_path, move |ev| {
+            pdf: RefCell::new(PdfEngine::new(pdfium_path, move |ev| {
                 pdf_waker.send(UiMsg::Pdf(ev))
             })),
             waker,
             rx,
             doc_gen: Cell::new(0),
-            pending_select: RefCell::new(None),
+            doc_stamp: Cell::new(None),
             pending_open: Cell::new(None),
             first_paint_logged: Cell::new(false),
             perf_text: RefCell::new(String::new()),
             cursor: Cell::new(CursorKind::Arrow),
             scroll_cache: Cell::new(None),
             scroll_scale: Cell::new(1.0),
+            sidebar_w: Cell::new(
+                session
+                    .sidebar_w
+                    .unwrap_or(SIDEBAR_DIP)
+                    .max(SIDEBAR_MIN_DIP),
+            ),
+            sidebar_hidden: Cell::new(session.sidebar_hidden),
             session: RefCell::new(session),
             session_path,
+            show_all: Cell::new(cfg.general.show_all_files),
+            config: RefCell::new(cfg),
+            config_path,
+            watcher: RefCell::new(Watcher::new(move |ev| watch_waker.send(UiMsg::Watch(ev)))),
+            watch_dirty: RefCell::new(WatchDirty::default()),
+            history: RefCell::new(History::default()),
+            split_drag: Cell::new(None),
             bench: RefCell::new(opts.bench_scroll.then(Bench::default)),
         });
         let app_ptr = Box::into_raw(app);
-        SetWindowLongPtrW(hwnd, GWLP_USERDATA, app_ptr as isize);
-        SetWindowLongPtrW(doc, GWLP_USERDATA, app_ptr as isize);
+        for h in [hwnd, doc, files, outline] {
+            SetWindowLongPtrW(h, GWLP_USERDATA, app_ptr as isize);
+        }
         let app = &*app_ptr;
 
+        app.apply_theme();
         app.apply_font(dpi);
-        app.fill_outline(&[]);
+        app.fill_outline(&[], false);
         app.set_status(0, "폴더를 열려면 Ctrl+O 또는 끌어다 놓기");
+        if let Some(e) = cfg_err {
+            app.set_status(1, &format!("설정 파일 오류 — 기본값 사용: {e}"));
+        }
 
         // 세션 복원: 창 위치 (FR-A02)
         let saved_window = app.session.borrow().window;
@@ -483,19 +652,21 @@ pub fn run(opts: StartOptions) -> Result<()> {
                 (s.root.clone(), s.open_file.clone())
             };
             if let Some(root) = root.filter(|r| r.is_dir()) {
-                let comps = file
-                    .as_deref()
-                    .and_then(|f| f.strip_prefix(&root).ok())
-                    .map(|rel| rel.iter().map(|c| c.to_os_string()).collect())
-                    .unwrap_or_default();
-                app.set_root(&root, comps);
+                app.set_root(&root);
+                if let Some(f) = file.filter(|f| f.is_file()) {
+                    app.reveal_in_tree(&f);
+                    app.open_file(f, OpenKind::Reload);
+                }
             }
         }
+        app.update_watch();
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
             if (msg.message == WM_KEYDOWN || msg.message == WM_SYSKEYDOWN)
-                && app.accelerator(msg.wParam.0 as u16, msg.message == WM_SYSKEYDOWN)
+                && guard_bool(app.hwnd, || {
+                    app.accelerator(msg.wParam.0 as u16, msg.message == WM_SYSKEYDOWN)
+                })
             {
                 continue;
             }
@@ -506,6 +677,16 @@ pub fn run(opts: StartOptions) -> Result<()> {
         // 프로세스 종료에 맡긴다 (FR-F08).
         Ok(())
     }
+}
+
+/// 가속기 처리 중 패닉도 잡는다
+fn guard_bool(hwnd: HWND, f: impl FnOnce() -> bool) -> bool {
+    catch_unwind(AssertUnwindSafe(f)).unwrap_or_else(|_| {
+        unsafe {
+            let _ = PostMessageW(Some(hwnd), WM_APP_PANIC, WPARAM(0), LPARAM(0));
+        }
+        true
+    })
 }
 
 fn is_md_path(p: &Path) -> bool {
@@ -543,6 +724,53 @@ fn set_clipboard(hwnd: HWND, s: &str) -> Result<()> {
     }
 }
 
+/// Windows 경로는 대소문자를 구분하지 않는다.
+fn same_path(a: &Path, b: &Path) -> bool {
+    a.as_os_str().to_string_lossy().to_lowercase() == b.as_os_str().to_string_lossy().to_lowercase()
+}
+
+/// (크기, 수정 시각). 파일 감시 이벤트가 실제 변경인지 가린다.
+fn file_stamp(p: &Path) -> Option<(u64, SystemTime)> {
+    let m = std::fs::metadata(p).ok()?;
+    Some((m.len(), m.modified().ok()?))
+}
+
+/// 이 앱이 여는 확장자: "열기" 동사가 다시 이 앱을 띄울 수 있어 편집기 후보에서 뺀다
+fn is_viewer_ext(p: &Path) -> bool {
+    p.extension()
+        .and_then(OsStr::to_str)
+        .is_some_and(leaf_core::is_supported_ext)
+}
+
+/// `"C:\…\code.exe" --flag 파일` → (실행 파일, 나머지 인자)
+fn split_command(line: &str) -> (String, String) {
+    let line = line.trim();
+    if let Some(rest) = line.strip_prefix('"')
+        && let Some(end) = rest.find('"')
+    {
+        return (rest[..end].to_owned(), rest[end + 1..].trim().to_owned());
+    }
+    match line.split_once(' ') {
+        Some((a, b)) => (a.to_owned(), b.trim().to_owned()),
+        None => (line.to_owned(), String::new()),
+    }
+}
+
+/// 실행하지 않고 탐색기에서 선택만 한다 (§6.3, FR-F10)
+fn reveal_in_explorer(hwnd: HWND, p: &Path) {
+    let args = wide(format!("/select,\"{}\"", p.display()));
+    unsafe {
+        ShellExecuteW(
+            Some(hwnd),
+            w!("open"),
+            w!("explorer.exe"),
+            PCWSTR(args.as_ptr()),
+            None,
+            SW_SHOWNORMAL,
+        );
+    }
+}
+
 impl App {
     fn dpi(&self) -> u32 {
         unsafe { GetDpiForWindow(self.hwnd).max(96) }
@@ -561,71 +789,257 @@ impl App {
                 0,
                 dpi,
             )
-            .is_ok()
+            .is_err()
             {
-                let font = CreateFontIndirectW(&ncm.lfMessageFont);
-                for h in [self.tabs, self.tree, self.outline, self.status] {
-                    SendMessageW(
-                        h,
-                        WM_SETFONT,
-                        Some(WPARAM(font.0 as usize)),
-                        Some(LPARAM(1)),
-                    );
-                }
-                self.bar.set_font(font);
-                let old = self.font.replace(font);
-                if !old.is_invalid() {
-                    let _ = DeleteObject(old.into());
+                return;
+            }
+            let font = CreateFontIndirectW(&ncm.lfMessageFont);
+            // 트리 펼침 표시·아이콘: Windows 11 기본 아이콘 글꼴
+            let mut lf = LOGFONTW {
+                lfHeight: -scale(12, dpi),
+                lfCharSet: DEFAULT_CHARSET,
+                lfQuality: CLEARTYPE_QUALITY,
+                ..Default::default()
+            };
+            for (d, s) in lf
+                .lfFaceName
+                .iter_mut()
+                .zip("Segoe Fluent Icons".encode_utf16())
+            {
+                *d = s;
+            }
+            let icon = CreateFontIndirectW(&lf);
+            self.tabs.set_font(font, dpi);
+            self.status.set_font(font, dpi);
+            self.bar.set_font(font);
+            let old = std::mem::replace(&mut *self.fonts.borrow_mut(), Fonts { text: font, icon });
+            for l in [&self.files, &self.outline] {
+                l.st.borrow_mut().set_dpi(dpi);
+                l.st.borrow().invalidate();
+            }
+            for h in [old.text, old.icon] {
+                if !h.is_invalid() {
+                    let _ = DeleteObject(h.into());
                 }
             }
         }
+    }
+
+    // ───── 테마 (FR-A03) ─────
+
+    fn want_dark(&self) -> bool {
+        match self.config.borrow().general.theme {
+            Theme::System => theme::system_dark(),
+            Theme::Light => false,
+            Theme::Dark => true,
+        }
+    }
+
+    /// 테마 적용: 색표 교체, 제목 표시줄·스크롤바·메뉴, D2D 타깃 다시 만들기
+    fn apply_theme(&self) {
+        let dark = self.want_dark();
+        theme::set(if dark { theme::DARK } else { theme::LIGHT });
+        theme::apply_title_bar(self.hwnd, dark);
+        theme::apply_menu_theme(dark);
+        for h in [self.doc, self.files.hwnd, self.outline.hwnd] {
+            theme::apply_scrollbar_theme(h, dark);
+        }
+        self.bar.apply_theme(dark);
+        self.view.borrow_mut().renderer.discard_target();
+        self.scroll_cache.set(None);
+        unsafe {
+            let _ = RedrawWindow(
+                Some(self.hwnd),
+                None,
+                None,
+                RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_FRAME,
+            );
+        }
+    }
+
+    // ───── 설정 (§8, FR-A07) ─────
+
+    fn reload_config(&self) {
+        let Some(path) = &self.config_path else {
+            return;
+        };
+        let (new, err) = Config::load(path);
+        let old = self.config.replace(new.clone());
+        match err {
+            Some(e) => self.set_status(1, &format!("설정 파일 오류 — 기본값 사용: {e}")),
+            None => self.set_status(1, "설정을 다시 읽었습니다"),
+        }
+        if old.general.theme != new.general.theme {
+            self.apply_theme();
+        }
+        if old.general.gpu != new.general.gpu {
+            self.view.borrow_mut().renderer.set_gpu(new.general.gpu);
+            self.invalidate_doc();
+        }
+        if old.general.show_all_files != new.general.show_all_files
+            || old.general.show_hidden != new.general.show_hidden
+        {
+            self.show_all.set(new.general.show_all_files);
+            self.relist_all();
+        }
+        if old.text != new.text
+            || old.markdown != new.markdown
+            || old.pdf != new.pdf
+            || old.memory != new.memory
+        {
+            self.reload_doc();
+        }
+    }
+
+    /// Ctrl+, : 설정 파일 열기. 없으면 기본값과 설명을 담아 만든다 (FR-A07)
+    fn open_config(&self) {
+        let Some(path) = self.config_path.clone() else {
+            return;
+        };
+        if !path.exists() {
+            let r = path
+                .parent()
+                .map(std::fs::create_dir_all)
+                .unwrap_or(Ok(()))
+                .and_then(|_| std::fs::write(&path, config::TEMPLATE));
+            if let Err(e) = r {
+                self.set_status(1, &format!("설정 파일을 만들 수 없습니다: {e}"));
+                return;
+            }
+        }
+        self.update_watch();
+        self.edit_externally(&path);
+    }
+
+    /// 외부 편집기로 열기 (FR-V10). 설정 `[editor] command`, 비우면 연결 프로그램(편집 → 열기 → 메모장)
+    fn edit_externally(&self, path: &Path) {
+        let cmd = self.config.borrow().editor.command.trim().to_owned();
+        let shell = |verb: PCWSTR, file: &OsStr, args: Option<&str>| -> bool {
+            let f = wide(file);
+            let a = args.map(wide);
+            let r = unsafe {
+                ShellExecuteW(
+                    Some(self.hwnd),
+                    verb,
+                    PCWSTR(f.as_ptr()),
+                    a.as_ref().map_or(PCWSTR::null(), |a| PCWSTR(a.as_ptr())),
+                    None,
+                    SW_SHOWNORMAL,
+                )
+            };
+            r.0 as isize > 32
+        };
+        let ok = if cmd.is_empty() {
+            shell(w!("edit"), path.as_os_str(), None)
+                || (!is_viewer_ext(path) && shell(w!("open"), path.as_os_str(), None))
+                || shell(
+                    w!("open"),
+                    OsStr::new("notepad.exe"),
+                    Some(&format!("\"{}\"", path.display())),
+                )
+        } else {
+            let line = if cmd.contains("{path}") {
+                cmd.replace("{path}", &path.display().to_string())
+            } else {
+                format!("{cmd} \"{}\"", path.display())
+            };
+            let (exe, args) = split_command(&line);
+            shell(w!("open"), OsStr::new(&exe), Some(&args))
+        };
+        if !ok {
+            self.set_status(1, &format!("편집기를 열 수 없습니다: {}", path.display()));
+        }
+    }
+
+    // ───── 배치 ─────
+
+    fn side_px(&self, client_w: i32) -> i32 {
+        if self.sidebar_hidden.get() {
+            return 0;
+        }
+        let dpi = self.dpi();
+        scale(self.sidebar_w.get(), dpi)
+            .min(client_w - scale(200, dpi))
+            .max(scale(SIDEBAR_MIN_DIP, dpi).min(client_w / 2))
     }
 
     fn layout(&self) {
         unsafe {
             let dpi = self.dpi();
-            SendMessageW(self.status, WM_SIZE, None, None);
             let mut rc = RECT::default();
             let _ = GetClientRect(self.hwnd, &mut rc);
-            let mut src = RECT::default();
-            let _ = GetWindowRect(self.status, &mut src);
-            let status_h = src.bottom - src.top;
+            let status_h = scale(STATUS_DIP, dpi);
             let h = (rc.bottom - status_h).max(0);
-            let side = scale(SIDEBAR_DIP, dpi).min(rc.right / 2);
+            let _ = MoveWindow(self.status.hwnd, 0, h, rc.right, status_h, true);
+            let side = self.side_px(rc.right);
+            let hidden = self.sidebar_hidden.get();
+            let split = if hidden { 0 } else { scale(SPLIT_DIP, dpi) };
             let tabs_h = scale(TABS_DIP, dpi);
-            let _ = MoveWindow(self.tabs, 0, 0, side, tabs_h, true);
-            for t in [self.tree, self.outline] {
-                let _ = MoveWindow(t, 0, tabs_h, side, (h - tabs_h).max(0), true);
+            let tab = self.active_tab.get();
+            let _ = ShowWindow(self.tabs.hwnd, if hidden { SW_HIDE } else { SW_SHOW });
+            for (i, l) in [&self.files, &self.outline].iter().enumerate() {
+                let _ = ShowWindow(
+                    l.hwnd,
+                    if !hidden && i == tab {
+                        SW_SHOW
+                    } else {
+                        SW_HIDE
+                    },
+                );
+                let _ = MoveWindow(l.hwnd, 0, tabs_h, side, (h - tabs_h).max(0), true);
             }
-            let doc_w = (rc.right - side).max(0);
+            let _ = MoveWindow(self.tabs.hwnd, 0, 0, side, tabs_h, true);
+            let x = side + split;
+            let doc_w = (rc.right - x).max(0);
             let bar_h = if self.bar_mode.get().is_some() {
                 scale(BAR_HEIGHT_DIP, dpi)
             } else {
                 0
             };
-            let _ = MoveWindow(self.bar.hwnd, side, 0, doc_w, bar_h, true);
+            let _ = MoveWindow(self.bar.hwnd, x, 0, doc_w, bar_h, true);
             self.bar.layout(doc_w, dpi);
-            let _ = MoveWindow(self.doc, side, bar_h, doc_w, (h - bar_h).max(0), true);
-            let parts = [(rc.right - scale(460, dpi)).max(100), -1];
-            SendMessageW(
-                self.status,
-                SB_SETPARTS,
-                Some(WPARAM(parts.len())),
-                Some(LPARAM(parts.as_ptr() as isize)),
-            );
+            let _ = MoveWindow(self.doc, x, bar_h, doc_w, (h - bar_h).max(0), true);
+            let _ = InvalidateRect(Some(self.hwnd), None, true);
+        }
+    }
+
+    /// 사이드바와 문서 사이 틈(폭 조절 손잡이) 안인지
+    fn in_splitter(&self, x: i32) -> bool {
+        if self.sidebar_hidden.get() {
+            return false;
+        }
+        let mut rc = RECT::default();
+        unsafe {
+            let _ = GetClientRect(self.hwnd, &mut rc);
+        }
+        let side = self.side_px(rc.right);
+        x >= side - 2 && x < side + scale(SPLIT_DIP, self.dpi()) + 2
+    }
+
+    /// Ctrl+B: 사이드바 접기/펴기 (FR-A05)
+    fn toggle_sidebar(&self) {
+        let hidden = !self.sidebar_hidden.get();
+        self.sidebar_hidden.set(hidden);
+        self.layout();
+        unsafe {
+            let _ = SetFocus(Some(if hidden {
+                self.doc
+            } else {
+                self.current_list().hwnd
+            }));
+        }
+    }
+
+    fn current_list(&self) -> &List {
+        if self.active_tab.get() == 1 {
+            &self.outline
+        } else {
+            &self.files
         }
     }
 
     fn set_status(&self, part: usize, text: &str) {
-        let wtext = wide(text);
-        unsafe {
-            SendMessageW(
-                self.status,
-                SB_SETTEXTW,
-                Some(WPARAM(part)),
-                Some(LPARAM(wtext.as_ptr() as isize)),
-            );
-        }
+        self.status.set_text(part, text);
     }
 
     fn invalidate_doc(&self) {
@@ -635,11 +1049,9 @@ impl App {
     }
 
     fn select_tab(&self, i: usize) {
-        unsafe {
-            SendMessageW(self.tabs, TCM_SETCURSEL, Some(WPARAM(i)), None);
-            let _ = ShowWindow(self.tree, if i == 0 { SW_SHOW } else { SW_HIDE });
-            let _ = ShowWindow(self.outline, if i == 1 { SW_SHOW } else { SW_HIDE });
-        }
+        self.active_tab.set(i.min(1));
+        self.tabs.set_active(i.min(1));
+        self.layout();
     }
 
     // ───── 키보드 가속기 ─────
@@ -649,16 +1061,22 @@ impl App {
         let ctrl = ctrl_down();
         let vk = VIRTUAL_KEY(vk);
         if alt {
-            // Alt+Z: 자동 줄바꿈 토글 (FR-T03)
-            if vk.0 == b'Z' as u16
-                && let Content::Text(tv) = &mut self.view.borrow_mut().content
-            {
-                tv.toggle_wrap();
-            } else {
-                return false;
+            match vk {
+                // Alt+←/→: 뒤로/앞으로 (FR-V02)
+                VK_LEFT => self.go_history(true),
+                VK_RIGHT => self.go_history(false),
+                // Alt+Z: 자동 줄바꿈 토글 (FR-T03)
+                _ if vk.0 == b'Z' as u16 => {
+                    if let Content::Text(tv) = &mut self.view.borrow_mut().content {
+                        tv.toggle_wrap();
+                    } else {
+                        return false;
+                    }
+                    self.scroll_cache.set(None);
+                    self.invalidate_doc();
+                }
+                _ => return false,
             }
-            self.scroll_cache.set(None);
-            self.invalidate_doc();
             return true;
         }
         match vk {
@@ -672,7 +1090,24 @@ impl App {
             },
             _ if ctrl && vk.0 == b'F' as u16 => self.show_bar(BarMode::Find),
             _ if ctrl && vk.0 == b'U' as u16 => return self.toggle_md_source(),
-            _ if ctrl && vk.0 == b'G' as u16 => self.show_bar(BarMode::Goto),
+            _ if ctrl && vk.0 == b'G' as u16 => {
+                let line = matches!(self.view.borrow().content, Content::Text(_));
+                self.show_bar(if line {
+                    BarMode::GotoLine
+                } else {
+                    BarMode::Goto
+                });
+            }
+            _ if ctrl && vk.0 == b'B' as u16 => self.toggle_sidebar(),
+            _ if ctrl && shift_down() && vk.0 == b'E' as u16 => match self.current_path() {
+                Some(p) => self.edit_externally(&p),
+                None => return false,
+            },
+            VK_OEM_COMMA if ctrl => self.open_config(),
+            VK_F5 => {
+                self.relist_all();
+                self.reload_doc();
+            }
             VK_F3 => {
                 if self.doc_query().is_some() {
                     self.find_step(!shift_down());
@@ -769,7 +1204,7 @@ impl App {
                     self.find_step(ev == BarEvent::Enter);
                 }
             }
-            (Some(BarMode::Goto), BarEvent::Enter) => {
+            (Some(BarMode::Goto | BarMode::GotoLine), BarEvent::Enter) => {
                 let n: u64 = self.bar.text().trim().parse().unwrap_or(0);
                 let mut msg = None;
                 match &mut self.view.borrow_mut().content {
@@ -953,6 +1388,7 @@ impl App {
                 }
                 Cmd::SetClipboard(s) => self.copy_to_clipboard(&s),
                 Cmd::OpenUri(u) => self.open_uri(&u),
+                Cmd::Jumped(pos) => self.push_history(pos),
             }
         }
     }
@@ -995,121 +1431,20 @@ impl App {
                 MdCmd::OpenDoc { path, anchor } => self.navigate(path, anchor),
                 MdCmd::Reveal(p) => {
                     // 지원하지 않는 파일은 실행하지 않고 탐색기에서 선택만 한다 (§6.3)
-                    let args = wide(format!("/select,\"{}\"", p.display()));
-                    unsafe {
-                        ShellExecuteW(
-                            Some(self.hwnd),
-                            w!("open"),
-                            w!("explorer.exe"),
-                            PCWSTR(args.as_ptr()),
-                            None,
-                            SW_SHOWNORMAL,
-                        );
-                    }
+                    reveal_in_explorer(self.hwnd, &p);
                     self.set_status(1, &format!("탐색기에서 보기: {}", p.display()));
                 }
                 MdCmd::Status(s) => self.set_status(1, &s),
+                MdCmd::Jumped(pos) => self.push_history(pos),
             }
         }
     }
 
-    /// 링크로 다른 문서 열기 (FR-M04): 트리 루트 아래면 트리에서 선택해 동기화한다.
+    /// 링크로 다른 문서 열기 (FR-M04): 트리 루트 아래면 트리 선택도 맞춘다.
     fn navigate(&self, path: PathBuf, anchor: Option<String>) {
         *self.pending_anchor.borrow_mut() = anchor.map(|a| (path.clone(), a));
-        if !self.select_in_tree(&path) {
-            self.open_file(path);
-        }
-    }
-
-    /// 루트 아래 파일을 트리에서 선택한다(접힌 폴더는 펼치며 찾아간다). 트리 밖이면 false.
-    fn select_in_tree(&self, path: &Path) -> bool {
-        let comps: Vec<OsString> = {
-            let m = self.model.borrow();
-            let Some(root) = m.nodes.first() else {
-                return false;
-            };
-            match path.strip_prefix(&root.path) {
-                Ok(rel) => rel.iter().map(|c| c.to_os_string()).collect(),
-                Err(_) => return false,
-            }
-        };
-        if comps.is_empty() {
-            return false;
-        }
-        let mut cur = 0usize;
-        for (i, comp) in comps.iter().enumerate() {
-            let (state, item) = {
-                let m = self.model.borrow();
-                (m.nodes[cur].state, m.nodes[cur].item)
-            };
-            match state {
-                LoadState::Loaded { .. } => {}
-                LoadState::Failed => return false,
-                _ => {
-                    // 아직 읽지 않은 폴더: 펼치고 읽기가 끝나면 이어서 찾는다
-                    *self.pending_select.borrow_mut() = Some((cur, comps[i..].to_vec()));
-                    unsafe {
-                        SendMessageW(
-                            self.tree,
-                            TVM_EXPAND,
-                            Some(WPARAM(TVE_EXPAND.0 as usize)),
-                            Some(LPARAM(item)),
-                        );
-                    }
-                    return true;
-                }
-            }
-            let child = {
-                let m = self.model.borrow();
-                let parent = m.nodes[cur].path.clone();
-                m.nodes
-                    .iter()
-                    .enumerate()
-                    .find(|(_, n)| {
-                        n.path.parent() == Some(parent.as_path())
-                            && n.path.file_name().map(|f| f.to_ascii_lowercase())
-                                == Some(comp.to_ascii_lowercase())
-                    })
-                    .map(|(i, n)| (i, n.item))
-            };
-            let Some((ci, citem)) = child else {
-                // 숨김 등으로 트리에 없는 파일
-                return false;
-            };
-            if i + 1 == comps.len() {
-                let already = unsafe {
-                    SendMessageW(
-                        self.tree,
-                        TVM_GETNEXTITEM,
-                        Some(WPARAM(TVGN_CARET as usize)),
-                        None,
-                    )
-                    .0
-                } == citem;
-                if already {
-                    return false;
-                }
-                unsafe {
-                    SendMessageW(
-                        self.tree,
-                        TVM_SELECTITEM,
-                        Some(WPARAM(TVGN_CARET as usize)),
-                        Some(LPARAM(citem)),
-                    );
-                }
-                return true;
-            }
-            unsafe {
-                SendMessageW(
-                    self.tree,
-                    TVM_EXPAND,
-                    Some(WPARAM(TVE_EXPAND.0 as usize)),
-                    Some(LPARAM(citem)),
-                );
-            }
-            cur = ci;
-        }
-        false
+        self.reveal_in_tree(&path);
+        self.open_file(path, OpenKind::Navigate);
     }
 
     /// Ctrl+U: MD 원문 보기 ↔ 렌더링 (FR-M09). 큰 MD(FR-M06)를 렌더링할 때도 쓴다.
@@ -1123,7 +1458,7 @@ impl App {
             return false;
         };
         self.md_mode.set(mode);
-        self.open_file(path);
+        self.open_file(path, OpenKind::Reload);
         true
     }
 
@@ -1134,77 +1469,78 @@ impl App {
         }
     }
 
-    // ───── 목차 (FR-P07) ─────
+    // ───── 목차 (FR-P07, FR-M07) ─────
 
-    fn fill_outline(&self, items: &[leaf_doc::OutlineItem]) {
-        let flat = pdfview::flatten_outline(items);
-        *self.outline_dests.borrow_mut() = flat.iter().map(|(_, _, d)| *d).collect();
-        unsafe {
-            SendMessageW(self.outline, WM_SETREDRAW, Some(WPARAM(0)), None);
-            SendMessageW(self.outline, TVM_DELETEITEM, None, Some(LPARAM(TVI_ROOT.0)));
+    /// `expand_all`: MD는 제목 계층을 모두 펼쳐 둔다(문서 목차처럼 한눈에), PDF는 맨 위 단계만
+    fn fill_outline(&self, items: &[leaf_doc::OutlineItem], expand_all: bool) {
+        {
+            let mut o = self.outline_data.borrow_mut();
+            o.items = pdfview::flatten_outline(items);
+            o.expanded = vec![expand_all; o.items.len()];
+            o.current = None;
         }
-        if flat.is_empty() {
-            self.insert_plain(self.outline, TVI_ROOT, "(목차 없음)", NO_NODE);
-        }
-        let mut stack: Vec<HTREEITEM> = Vec::new();
-        let mut items = Vec::with_capacity(flat.len());
-        for (i, (depth, title, _)) in flat.iter().enumerate() {
-            stack.truncate(*depth);
-            let parent = stack.last().copied().unwrap_or(TVI_ROOT);
-            let title = if title.is_empty() {
-                "(제목 없음)"
-            } else {
-                title.as_str()
-            };
-            let item = self.insert_plain(self.outline, parent, title, i as isize);
-            stack.push(item);
-            items.push(item);
-        }
-        *self.outline_items.borrow_mut() = items;
-        self.outline_current.set(None);
-        unsafe {
-            SendMessageW(self.outline, WM_SETREDRAW, Some(WPARAM(1)), None);
-            let _ = InvalidateRect(Some(self.outline), None, true);
-        }
+        self.rebuild_outline_rows();
+        let mut st = self.outline.st.borrow_mut();
+        st.select_key(None, false);
+        st.scroll_to_top();
     }
 
-    fn insert_plain(&self, tree: HWND, parent: HTREEITEM, text: &str, lparam: isize) -> HTREEITEM {
-        let mut wtext = wide(text);
-        let tvis = TVINSERTSTRUCTW {
-            hParent: parent,
-            hInsertAfter: TVI_LAST,
-            Anonymous: TVINSERTSTRUCTW_0 {
-                item: TVITEMW {
-                    mask: TVIF_TEXT | TVIF_PARAM,
-                    pszText: PWSTR(wtext.as_mut_ptr()),
-                    lParam: LPARAM(lparam),
-                    ..Default::default()
-                },
-            },
+    fn rebuild_outline_rows(&self) {
+        let rows = {
+            let o = self.outline_data.borrow();
+            let mut rows = Vec::new();
+            let mut hide_below: Option<usize> = None;
+            for (i, (depth, title, _)) in o.items.iter().enumerate() {
+                if let Some(d) = hide_below {
+                    if *depth > d {
+                        continue;
+                    }
+                    hide_below = None;
+                }
+                let has_children = o.items.get(i + 1).is_some_and(|n| n.0 > *depth);
+                if has_children && !o.expanded[i] {
+                    hide_below = Some(*depth);
+                }
+                let title = if title.is_empty() {
+                    "(제목 없음)"
+                } else {
+                    title.as_str()
+                };
+                rows.push(Row {
+                    key: i as isize,
+                    depth: *depth as u16,
+                    text: title.encode_utf16().collect(),
+                    icon: Icon::None,
+                    expandable: has_children,
+                    expanded: o.expanded[i],
+                    dim: false,
+                });
+            }
+            if rows.is_empty() {
+                rows.push(Row {
+                    key: -1,
+                    depth: 0,
+                    text: "(목차 없음)".encode_utf16().collect(),
+                    icon: Icon::None,
+                    expandable: false,
+                    expanded: false,
+                    dim: true,
+                });
+            }
+            rows
         };
-        let r = unsafe {
-            SendMessageW(
-                tree,
-                TVM_INSERTITEMW,
-                None,
-                Some(LPARAM(&tvis as *const _ as isize)),
-            )
-        };
-        HTREEITEM(r.0)
+        self.outline.st.borrow_mut().set_rows(rows);
     }
 
-    fn on_outline_notify(&self, lparam: LPARAM) -> LRESULT {
-        let hdr = unsafe { &*(lparam.0 as *const NMHDR) };
-        if hdr.code == TVN_SELCHANGEDW {
-            let nm = unsafe { &*(lparam.0 as *const NMTREEVIEWW) };
-            // 프로그램이 바꾼 선택(TVC_UNKNOWN)은 무시
-            if nm.action != TVC_UNKNOWN && nm.itemNew.lParam.0 >= 0 {
+    fn on_outline_event(&self, ev: ListEvent) {
+        match ev {
+            ListEvent::Select(i) | ListEvent::Activate(i) if i >= 0 => {
                 let dest = self
-                    .outline_dests
+                    .outline_data
                     .borrow()
-                    .get(nm.itemNew.lParam.0 as usize)
-                    .copied()
-                    .flatten();
+                    .items
+                    .get(i as usize)
+                    .and_then(|x| x.2);
                 if let Some(d) = dest {
                     match &mut self.view.borrow_mut().content {
                         Content::Pdf(pv) => pv.go_to(d),
@@ -1212,124 +1548,85 @@ impl App {
                         Content::Md(mv) => mv.go_unit(d.page as usize),
                         _ => {}
                     }
+                    self.outline_data.borrow_mut().current = Some(i as usize);
                 }
                 self.invalidate_doc();
             }
+            ListEvent::Toggle(i, e) if i >= 0 => {
+                if let Some(x) = self.outline_data.borrow_mut().expanded.get_mut(i as usize) {
+                    *x = e;
+                }
+                self.rebuild_outline_rows();
+            }
+            _ => {}
         }
-        LRESULT(0)
     }
 
-    // ───── 폴더 / 트리 ─────
+    // ───── 폴더 / 트리 (FR-F) ─────
 
-    /// FR-A01: 폴더면 루트로, 파일이면 상위 폴더를 루트로 열고 그 파일을 선택.
+    /// FR-A01: 폴더면 루트로, 파일이면 상위 폴더를 루트로 열고 그 파일을 연다.
     fn open_path(&self, p: &Path) {
         let p = std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
         if p.is_dir() {
-            self.set_root(&p, Vec::new());
-        } else if let (Some(parent), Some(name)) = (p.parent(), p.file_name()) {
-            self.set_root(parent, vec![name.to_os_string()]);
+            self.set_root(&p);
+        } else if let Some(parent) = p.parent().filter(|_| p.is_file()) {
+            let same_root = self
+                .model
+                .borrow()
+                .root()
+                .is_some_and(|r| same_path(&r.path, parent));
+            if !same_root {
+                self.set_root(parent);
+            }
+            self.reveal_in_tree(&p);
+            self.open_file(p, OpenKind::Navigate);
         } else {
             self.set_status(0, &format!("열 수 없는 경로: {}", p.display()));
         }
+        self.update_watch();
     }
 
-    /// `select`: 루트 아래 상대 경로 조각들. 폴더를 차례로 펼쳐 그 파일을 선택한다.
-    fn set_root(&self, root: &Path, select: Vec<OsString>) {
+    fn set_root(&self, root: &Path) {
+        self.model.borrow_mut().set_root(root);
+        *self.pending_reveal.borrow_mut() = None;
+        self.files.st.borrow_mut().select_key(None, false);
+        self.toggle_node(0, true);
+        self.files.st.borrow_mut().select_key(Some(0), true);
         unsafe {
-            SendMessageW(self.tree, TVM_DELETEITEM, None, Some(LPARAM(TVI_ROOT.0)));
-        }
-        let display = root
-            .file_name()
-            .map(|n| n.to_os_string())
-            .unwrap_or_else(|| root.as_os_str().to_os_string());
-        {
-            let mut m = self.model.borrow_mut();
-            m.generation += 1;
-            m.nodes.clear();
-            m.nodes.push(Node {
-                path: root.to_path_buf(),
-                name: wide(&display),
-                is_dir: true,
-                state: LoadState::NotLoaded,
-                item: 0,
-                placeholder: 0,
-            });
-        }
-        *self.pending_select.borrow_mut() = (!select.is_empty()).then_some((0, select));
-        let item = self.insert_item(TVI_ROOT, TVI_LAST, 0, true);
-        self.model.borrow_mut().nodes[0].item = item.0;
-        unsafe {
-            SendMessageW(
-                self.tree,
-                TVM_EXPAND,
-                Some(WPARAM(TVE_EXPAND.0 as usize)),
-                Some(LPARAM(item.0)),
-            );
             let title = wide(format!("{} — LeafViewer", root.display()));
             let _ = SetWindowTextW(self.hwnd, PCWSTR(title.as_ptr()));
         }
         self.set_status(0, &root.display().to_string());
+        self.update_watch();
     }
 
-    /// `after`: 직전에 넣은 형제 항목 (TVI_LAST는 형제 목록을 끝까지 훑는다).
-    fn insert_item(
-        &self,
-        parent: HTREEITEM,
-        after: HTREEITEM,
-        idx: usize,
-        is_dir: bool,
-    ) -> HTREEITEM {
-        let tvis = TVINSERTSTRUCTW {
-            hParent: parent,
-            hInsertAfter: after,
-            Anonymous: TVINSERTSTRUCTW_0 {
-                item: TVITEMW {
-                    mask: TVIF_TEXT | TVIF_CHILDREN | TVIF_PARAM,
-                    pszText: LPSTR_TEXTCALLBACKW,
-                    cChildren: if is_dir {
-                        I_CHILDRENCALLBACK
-                    } else {
-                        TVITEMEXW_CHILDREN(0)
-                    },
-                    lParam: LPARAM(idx as isize),
-                    ..Default::default()
-                },
-            },
-        };
-        let r = unsafe {
-            SendMessageW(
-                self.tree,
-                TVM_INSERTITEMW,
-                None,
-                Some(LPARAM(&tvis as *const _ as isize)),
-            )
-        };
-        HTREEITEM(r.0)
-    }
-
-    /// TVN_ITEMEXPANDING: 펼칠 때 그 폴더만 워커에서 읽는다 (FR-F02, FR-F08).
-    fn on_expanding(&self, idx: usize, item: HTREEITEM) {
-        let (path, generation) = {
-            let mut m = self.model.borrow_mut();
-            let generation = m.generation;
-            let Some(n) = m.nodes.get_mut(idx) else {
-                return;
-            };
-            if !n.is_dir || n.state != LoadState::NotLoaded {
-                return;
-            }
-            n.state = LoadState::Loading;
-            (n.path.clone(), generation)
-        };
-        let ph = self.insert_plain(self.tree, item, "불러오는 중…", NO_NODE);
-        if let Some(n) = self.model.borrow_mut().nodes.get_mut(idx) {
-            n.placeholder = ph.0;
+    fn list_options(&self) -> ListOptions {
+        ListOptions {
+            show_all_files: self.show_all.get(),
+            show_hidden: self.config.borrow().general.show_hidden,
         }
+    }
+
+    /// 펼치기/접기. 처음 펼치는 폴더는 워커에서 읽는다 (FR-F02, FR-F08).
+    fn toggle_node(&self, idx: usize, expand: bool) {
+        let need = self.model.borrow_mut().set_expanded(idx, expand);
+        if need {
+            self.list_dir(idx);
+        }
+        self.rebuild_file_rows();
+    }
+
+    fn list_dir(&self, idx: usize) {
+        let (path, generation) = {
+            let m = self.model.borrow();
+            let Some(n) = m.get(idx) else { return };
+            (n.path.clone(), m.generation)
+        };
+        let opts = self.list_options();
         let waker = self.waker.clone();
         let started = Instant::now();
         self.workers.spawn(move || {
-            let result =
-                fs_tree::list_dir(&path, ListOptions::default()).map_err(|e| e.to_string());
+            let result = guarded(|| fs_tree::list_dir(&path, opts).map_err(|e| e.to_string()));
             if let Ok(v) = &result {
                 perf::record(
                     "list_dir_ms",
@@ -1348,6 +1645,14 @@ impl App {
         });
     }
 
+    /// 읽어 둔 폴더를 모두 다시 읽는다 (F5, 감시 이벤트 유실, 필터 변경)
+    fn relist_all(&self) {
+        let dirs = self.model.borrow().listed_dirs();
+        for d in dirs {
+            self.list_dir(d);
+        }
+    }
+
     fn on_dir_listed(
         &self,
         generation: u64,
@@ -1355,188 +1660,294 @@ impl App {
         result: std::result::Result<Vec<Entry>, String>,
     ) {
         let t = Instant::now();
-        let (parent_item, placeholder, range, err) = {
+        let (added, count) = {
             let mut m = self.model.borrow_mut();
-            if m.generation != generation
-                || m.nodes
-                    .get(idx)
-                    .is_none_or(|n| n.state != LoadState::Loading)
-            {
+            if m.generation != generation || m.get(idx).is_none() {
                 return;
             }
-            let parent_path = m.nodes[idx].path.clone();
-            let start = m.nodes.len();
-            let err = match result {
-                Ok(entries) => {
-                    for e in entries {
-                        m.nodes.push(Node {
-                            path: parent_path.join(&e.name),
-                            name: wide(&e.name),
-                            is_dir: e.is_dir,
-                            state: LoadState::NotLoaded,
-                            item: 0,
-                            placeholder: 0,
-                        });
-                    }
-                    None
-                }
-                Err(e) => Some(e),
-            };
-            let end = m.nodes.len();
-            let n = &mut m.nodes[idx];
-            n.state = if err.is_some() {
-                LoadState::Failed
-            } else {
-                LoadState::Loaded {
-                    has_children: end > start,
-                }
-            };
-            (
-                HTREEITEM(n.item),
-                HTREEITEM(std::mem::take(&mut n.placeholder)),
-                start..end,
-                err,
-            )
+            let added = m.apply_listing(idx, result);
+            (added, m.get(idx).map_or(0, |n| n.children.len()))
         };
-
-        unsafe {
-            SendMessageW(self.tree, WM_SETREDRAW, Some(WPARAM(0)), None);
-            if placeholder.0 != 0 {
-                SendMessageW(self.tree, TVM_DELETEITEM, None, Some(LPARAM(placeholder.0)));
+        // 세션에서 펼쳐 두었던 하위 폴더를 이어서 펼친다 (FR-A02)
+        let reopen: Vec<usize> = {
+            let mut pe = self.pending_expand.borrow_mut();
+            if pe.is_empty() {
+                Vec::new()
+            } else {
+                let m = self.model.borrow();
+                added
+                    .iter()
+                    .copied()
+                    .filter(|&c| {
+                        let n = &m.nodes[c];
+                        n.is_dir && {
+                            let hit = pe.iter().position(|p| same_path(p, &n.path));
+                            if let Some(k) = hit {
+                                pe.swap_remove(k);
+                            }
+                            hit.is_some()
+                        }
+                    })
+                    .collect()
+            }
+        };
+        for c in reopen {
+            if self.model.borrow_mut().set_expanded(c, true) {
+                self.list_dir(c);
             }
         }
-        let count = range.len();
-        if let Some(e) = err {
-            self.insert_plain(
-                self.tree,
-                parent_item,
-                &format!("⚠ 읽을 수 없음: {e}"),
-                NO_NODE,
-            );
-        } else {
-            let mut after = TVI_FIRST;
-            let items: Vec<(usize, HTREEITEM)> = range
-                .map(|i| {
-                    let is_dir = self.model.borrow().nodes[i].is_dir;
-                    after = self.insert_item(parent_item, after, i, is_dir);
-                    (i, after)
-                })
-                .collect();
-            let mut m = self.model.borrow_mut();
-            for (i, it) in items {
-                m.nodes[i].item = it.0;
-            }
-        }
-        if count == 0 {
-            // 빈 폴더: 펼침 버튼 제거
-            let item = TVITEMW {
-                mask: TVIF_CHILDREN,
-                hItem: parent_item,
-                cChildren: TVITEMEXW_CHILDREN(0),
-                ..Default::default()
-            };
-            unsafe {
-                SendMessageW(
-                    self.tree,
-                    TVM_SETITEMW,
-                    None,
-                    Some(LPARAM(&item as *const _ as isize)),
-                );
-            }
-        }
-        unsafe {
-            SendMessageW(self.tree, WM_SETREDRAW, Some(WPARAM(1)), None);
-            let _ = InvalidateRect(Some(self.tree), None, true);
-        }
+        self.rebuild_file_rows();
         perf::record(
             "tree_insert_ms",
             format!("{:.2} entries={count}", t.elapsed().as_secs_f64() * 1000.0),
         );
-        self.continue_pending_select(idx);
+        self.advance_reveal();
     }
 
-    /// 명령줄·세션으로 받은 파일까지 폴더를 차례로 펼친다.
-    fn continue_pending_select(&self, listed: usize) {
-        let Some((want, comps)) = self.pending_select.borrow_mut().take() else {
-            return;
-        };
-        if want != listed {
-            *self.pending_select.borrow_mut() = Some((want, comps));
-            return;
-        }
-        let found = {
+    fn rebuild_file_rows(&self) {
+        let rows: Vec<Row> = {
             let m = self.model.borrow();
-            let parent = &m.nodes[listed].path;
-            m.nodes
-                .iter()
-                .enumerate()
-                .find(|(_, n)| {
-                    n.path.parent() == Some(parent.as_path())
-                        && n.path.file_name() == Some(comps[0].as_os_str())
+            m.visible()
+                .into_iter()
+                .map(|r| match r {
+                    VisRow::Node { idx, depth } => {
+                        let n = &m.nodes[idx];
+                        Row {
+                            key: idx as isize,
+                            depth,
+                            text: n.name.encode_utf16().collect(),
+                            icon: if n.is_dir { Icon::Folder } else { Icon::File },
+                            expandable: m.expandable(idx),
+                            expanded: n.expanded,
+                            dim: false,
+                        }
+                    }
+                    VisRow::Status { parent, depth } => {
+                        let (text, icon) = match &m.nodes[parent].state {
+                            LoadState::Failed(e) => (format!("읽을 수 없음: {e}"), Icon::Warning),
+                            _ => ("불러오는 중…".to_owned(), Icon::None),
+                        };
+                        Row {
+                            key: -1,
+                            depth,
+                            text: text.encode_utf16().collect(),
+                            icon,
+                            expandable: false,
+                            expanded: false,
+                            dim: true,
+                        }
+                    }
                 })
-                .map(|(i, n)| (i, n.item))
+                .collect()
         };
-        let Some((child, item)) = found else { return };
-        unsafe {
-            if comps.len() == 1 {
-                SendMessageW(
-                    self.tree,
-                    TVM_SELECTITEM,
-                    Some(WPARAM(TVGN_CARET as usize)),
-                    Some(LPARAM(item)),
-                );
-            } else {
-                *self.pending_select.borrow_mut() = Some((child, comps[1..].to_vec()));
-                SendMessageW(
-                    self.tree,
-                    TVM_EXPAND,
-                    Some(WPARAM(TVE_EXPAND.0 as usize)),
-                    Some(LPARAM(item)),
-                );
-            }
+        self.files.st.borrow_mut().set_rows(rows);
+    }
+
+    /// 트리에서 그 파일을 찾아 선택한다(접힌 폴더는 펼치며 찾아간다). 문서는 열지 않는다.
+    /// 루트 밖 파일이면 아무것도 하지 않는다.
+    fn reveal_in_tree(&self, path: &Path) {
+        let under = self
+            .model
+            .borrow()
+            .root()
+            .is_some_and(|r| path.starts_with(&r.path) && path != r.path);
+        if under {
+            *self.pending_reveal.borrow_mut() = Some(path.to_path_buf());
+            self.advance_reveal();
         }
     }
 
-    fn on_tree_notify(&self, lparam: LPARAM) -> LRESULT {
-        let hdr = unsafe { &*(lparam.0 as *const NMHDR) };
-        match hdr.code {
-            TVN_GETDISPINFOW => {
-                let di = unsafe { &mut *(lparam.0 as *mut NMTVDISPINFOW) };
-                let idx = di.item.lParam.0;
-                if idx < 0 {
-                    return LRESULT(0);
+    fn advance_reveal(&self) {
+        let Some(target) = self.pending_reveal.borrow().clone() else {
+            return;
+        };
+        let comps: Vec<OsString> = {
+            let m = self.model.borrow();
+            let Some(root) = m.root() else { return };
+            match target.strip_prefix(&root.path) {
+                Ok(rel) => rel.iter().map(|c| c.to_os_string()).collect(),
+                Err(_) => return,
+            }
+        };
+        let mut cur = 0usize;
+        let mut changed = false;
+        for (i, comp) in comps.iter().enumerate() {
+            let state = self.model.borrow().get(cur).map(|n| n.state.clone());
+            match state {
+                Some(LoadState::Loaded) => {
+                    if !self.model.borrow().nodes[cur].expanded {
+                        self.model.borrow_mut().set_expanded(cur, true);
+                        changed = true;
+                    }
                 }
-                let Ok(m) = self.model.try_borrow() else {
-                    return LRESULT(0);
-                };
-                let Some(n) = m.get(idx as usize) else {
-                    return LRESULT(0);
-                };
-                if di.item.mask.contains(TVIF_TEXT) {
-                    di.item.pszText = PWSTR(n.name.as_ptr() as *mut u16);
+                Some(LoadState::NotLoaded) => {
+                    // 아직 읽지 않은 폴더: 펼치고 읽기가 끝나면 이어서 찾는다
+                    self.toggle_node(cur, true);
+                    return;
                 }
-                if di.item.mask.contains(TVIF_CHILDREN) {
-                    di.item.cChildren = TVITEMEXW_CHILDREN(m.has_children(idx as usize) as i32);
+                Some(LoadState::Loading) => return,
+                _ => {
+                    *self.pending_reveal.borrow_mut() = None;
+                    break;
                 }
             }
-            TVN_ITEMEXPANDINGW => {
-                let nm = unsafe { &*(lparam.0 as *const NMTREEVIEWW) };
-                if nm.action == TVE_EXPAND && nm.itemNew.lParam.0 >= 0 {
-                    self.on_expanding(nm.itemNew.lParam.0 as usize, nm.itemNew.hItem);
+            let child = self.model.borrow().find_child(cur, comp);
+            let Some(c) = child else {
+                // 숨김·필터 등으로 트리에 없는 파일
+                *self.pending_reveal.borrow_mut() = None;
+                break;
+            };
+            if i + 1 == comps.len() {
+                *self.pending_reveal.borrow_mut() = None;
+                if changed {
+                    self.rebuild_file_rows();
+                    changed = false;
                 }
+                self.files
+                    .st
+                    .borrow_mut()
+                    .select_key(Some(c as isize), true);
+                break;
             }
-            TVN_SELCHANGEDW => {
-                let nm = unsafe { &*(lparam.0 as *const NMTREEVIEWW) };
-                let idx = nm.itemNew.lParam.0;
-                if idx >= 0 {
+            cur = c;
+        }
+        if changed {
+            self.rebuild_file_rows();
+        }
+    }
+
+    fn on_files_event(&self, ev: ListEvent) {
+        match ev {
+            ListEvent::Select(k) if k >= 0 => {
+                let is_file = self
+                    .model
+                    .borrow()
+                    .get(k as usize)
+                    .is_some_and(|n| !n.is_dir);
+                if is_file {
                     // FR-F06: 100ms 디바운스 — 빠르게 넘기면 중간 파일은 열지 않는다
-                    self.pending_open.set(Some(idx as usize));
+                    self.pending_open.set(Some(k as usize));
                     unsafe { SetTimer(Some(self.hwnd), TIMER_SELECT, 100, None) };
                 }
             }
+            ListEvent::Activate(k) if k >= 0 => {
+                let node = self
+                    .model
+                    .borrow()
+                    .get(k as usize)
+                    .map(|n| (n.is_dir, n.expanded));
+                match node {
+                    Some((true, expanded)) => self.toggle_node(k as usize, !expanded),
+                    Some((false, _)) => {
+                        unsafe {
+                            let _ = KillTimer(Some(self.hwnd), TIMER_SELECT);
+                        }
+                        self.pending_open.set(None);
+                        self.open_node(k as usize);
+                        unsafe {
+                            let _ = SetFocus(Some(self.doc));
+                        }
+                    }
+                    None => {}
+                }
+            }
+            ListEvent::Toggle(k, e) if k >= 0 => self.toggle_node(k as usize, e),
+            ListEvent::Menu(k, pt) if k >= 0 => self.file_menu(k as usize, pt),
             _ => {}
         }
-        LRESULT(0)
+    }
+
+    /// 파일 트리 우클릭 메뉴 (FR-F10, FR-F03)
+    fn file_menu(&self, idx: usize, pt: POINT) {
+        const OPEN: usize = 1;
+        const REVEAL: usize = 2;
+        const COPY: usize = 3;
+        const SHELL: usize = 4;
+        const EDIT: usize = 5;
+        const SHOW_ALL: usize = 6;
+        const REFRESH: usize = 7;
+        let Some((path, is_dir)) = self
+            .model
+            .borrow()
+            .get(idx)
+            .map(|n| (n.path.clone(), n.is_dir))
+        else {
+            return;
+        };
+        let cmd = unsafe {
+            let Ok(m) = CreatePopupMenu() else { return };
+            let add = |id: usize, text: &str, flags: MENU_ITEM_FLAGS| {
+                let t = wide(text);
+                let _ = AppendMenuW(m, MF_STRING | flags, id, PCWSTR(t.as_ptr()));
+            };
+            if !is_dir {
+                add(OPEN, "열기\tEnter", MF_ENABLED);
+            }
+            add(REVEAL, "탐색기에서 보기", MF_ENABLED);
+            add(COPY, "경로 복사", MF_ENABLED);
+            if !is_dir {
+                add(SHELL, "기본 앱으로 열기", MF_ENABLED);
+                add(EDIT, "외부 편집기로 열기", MF_ENABLED);
+            }
+            let _ = AppendMenuW(m, MF_SEPARATOR, 0, None);
+            add(
+                SHOW_ALL,
+                "모든 파일 표시",
+                if self.show_all.get() {
+                    MF_CHECKED
+                } else {
+                    MF_UNCHECKED
+                },
+            );
+            add(REFRESH, "새로 고침\tF5", MF_ENABLED);
+            let r = TrackPopupMenu(
+                m,
+                TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                pt.x,
+                pt.y,
+                None,
+                self.hwnd,
+                None,
+            );
+            let _ = DestroyMenu(m);
+            r.0 as usize
+        };
+        match cmd {
+            OPEN => self.open_node(idx),
+            REVEAL => reveal_in_explorer(self.hwnd, &path),
+            COPY => {
+                let s = path.display().to_string();
+                if set_clipboard(self.hwnd, &s).is_ok() {
+                    self.set_status(1, &format!("경로 복사함: {s}"));
+                }
+            }
+            SHELL => {
+                let p = wide(&path);
+                let r = unsafe {
+                    ShellExecuteW(
+                        Some(self.hwnd),
+                        w!("open"),
+                        PCWSTR(p.as_ptr()),
+                        None,
+                        None,
+                        SW_SHOWNORMAL,
+                    )
+                };
+                if (r.0 as isize) <= 32 {
+                    self.set_status(1, &format!("연결된 앱이 없습니다: {}", path.display()));
+                }
+            }
+            EDIT => self.edit_externally(&path),
+            SHOW_ALL => {
+                self.show_all.set(!self.show_all.get());
+                self.relist_all();
+            }
+            REFRESH => {
+                self.relist_all();
+                self.reload_doc();
+            }
+            _ => {}
+        }
     }
 
     fn pick_folder(&self) {
@@ -1556,10 +1967,219 @@ impl App {
             })()
         };
         match result {
-            Ok(Some(p)) => self.set_root(&p, Vec::new()),
+            Ok(Some(p)) => self.set_root(&p),
             Ok(None) => {}
             Err(e) => self.set_status(0, &format!("폴더 선택 실패: {e}")),
         }
+    }
+
+    // ───── 파일 감시 (FR-F05, FR-V06, FR-A07) ─────
+
+    /// 감시 대상: 루트(하위 포함), 루트 밖 문서의 폴더, 설정 파일 폴더
+    fn update_watch(&self) {
+        let mut targets = Vec::new();
+        let root = self.model.borrow().root().map(|r| r.path.clone());
+        if let Some(r) = &root {
+            targets.push((r.clone(), true));
+        }
+        if let Some(p) = self.current_path()
+            && let Some(dir) = p.parent()
+            && !root.as_ref().is_some_and(|r| dir.starts_with(r))
+        {
+            targets.push((dir.to_path_buf(), false));
+        }
+        if let Some(dir) = self.config_path.as_ref().and_then(|p| p.parent())
+            && dir.is_dir()
+            && !targets
+                .iter()
+                .any(|(t, rec)| dir == t || (*rec && dir.starts_with(t)))
+        {
+            targets.push((dir.to_path_buf(), false));
+        }
+        let errors = self.watcher.borrow_mut().set(&targets);
+        if let Some(e) = errors.first() {
+            perf::record("watch_error", e);
+        }
+    }
+
+    fn on_watch(&self, ev: WatchEvent) {
+        let mut d = self.watch_dirty.borrow_mut();
+        match ev {
+            WatchEvent::Changed(ps) => {
+                if d.paths.len() < 10_000 {
+                    d.paths.extend(ps);
+                } else {
+                    d.rescan = true;
+                }
+            }
+            WatchEvent::Rescan => d.rescan = true,
+        }
+        // 고정 창(트로틀): 계속 쓰이는 로그 파일도 200ms마다는 반영된다
+        if !d.timer {
+            d.timer = true;
+            unsafe { SetTimer(Some(self.hwnd), TIMER_WATCH, WATCH_DEBOUNCE_MS, None) };
+        }
+    }
+
+    fn flush_watch(&self) {
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd), TIMER_WATCH);
+        }
+        let WatchDirty { paths, rescan, .. } = std::mem::take(&mut *self.watch_dirty.borrow_mut());
+        let doc = self.current_path();
+        let mut dirs: Vec<usize> = Vec::new();
+        let mut doc_hit = rescan;
+        let mut config_hit = false;
+        if rescan {
+            dirs = self.model.borrow().listed_dirs();
+        }
+        {
+            let m = self.model.borrow();
+            for p in &paths {
+                if let Some(parent) = p.parent()
+                    && let Some(i) = m.find_path(parent)
+                    && m.nodes[i].is_dir
+                    && matches!(m.nodes[i].state, LoadState::Loaded | LoadState::Failed(_))
+                    && !dirs.contains(&i)
+                {
+                    dirs.push(i);
+                }
+                if doc.as_ref().is_some_and(|d| same_path(d, p)) {
+                    doc_hit = true;
+                }
+                if self.config_path.as_ref().is_some_and(|c| same_path(c, p)) {
+                    config_hit = true;
+                }
+            }
+        }
+        for d in dirs {
+            self.list_dir(d);
+        }
+        if config_hit {
+            self.reload_config();
+        }
+        if doc_hit && self.doc_changed_on_disk() {
+            self.reload_doc();
+        }
+    }
+
+    /// 감시 이벤트가 실제 내용 변경인지: 크기·수정 시각을 비교한다 (없어졌으면 true)
+    fn doc_changed_on_disk(&self) -> bool {
+        let Some(p) = self.current_path() else {
+            return false;
+        };
+        let now = file_stamp(&p);
+        now.is_none() || now != self.doc_stamp.get()
+    }
+
+    /// 지금 문서를 다시 읽는다. 위치는 세션 기록으로 복원된다 (FR-V06)
+    fn reload_doc(&self) {
+        let (path, mode, mapped) = match &self.view.borrow().content {
+            Content::Md(mv) => (mv.path.clone(), MdMode::Render, false),
+            Content::Text(tv) => (
+                tv.path.clone(),
+                if is_md_path(&tv.path) {
+                    MdMode::Raw
+                } else {
+                    MdMode::Auto
+                },
+                tv.is_mapped(),
+            ),
+            Content::Pdf(pv) => (pv.path.clone(), MdMode::Auto, false),
+            _ => return,
+        };
+        if mapped {
+            // 매핑을 바로 놓아 다른 프로그램의 저장을 막지 않는다 (§4.5 mmap 주의, U-04)
+            self.remember_current();
+            self.set_content(Content::Message("파일이 바뀌어 다시 읽는 중…".into()));
+        }
+        self.md_mode.set(mode);
+        self.open_file(path, OpenKind::Reload);
+    }
+
+    // ───── 뒤로 / 앞으로 (FR-V02) ─────
+
+    fn current_pos(&self) -> Option<FilePos> {
+        match &self.view.borrow().content {
+            Content::Pdf(pv) => Some(pv.position()),
+            Content::Text(tv) => Some(tv.position()),
+            Content::Md(mv) => Some(mv.position()),
+            _ => None,
+        }
+    }
+
+    fn current_path(&self) -> Option<PathBuf> {
+        match &self.view.borrow().content {
+            Content::Pdf(pv) => Some(pv.path.clone()),
+            Content::Text(tv) => Some(tv.path.clone()),
+            Content::Md(mv) => Some(mv.path.clone()),
+            _ => None,
+        }
+    }
+
+    fn push_history(&self, pos: FilePos) {
+        self.history.borrow_mut().push(pos);
+    }
+
+    fn go_history(&self, back: bool) {
+        let target = {
+            let mut h = self.history.borrow_mut();
+            if back { h.back.pop() } else { h.fwd.pop() }
+        };
+        let Some(pos) = target else {
+            self.set_status(
+                1,
+                if back {
+                    "뒤로 갈 곳이 없습니다"
+                } else {
+                    "앞으로 갈 곳이 없습니다"
+                },
+            );
+            return;
+        };
+        if let Some(cur) = self.current_pos() {
+            let mut h = self.history.borrow_mut();
+            if back {
+                h.fwd.push(cur)
+            } else {
+                h.back.push(cur)
+            }
+        }
+        // 같은 문서·같은 보기면 위치만 옮긴다
+        let same = {
+            let mut v = self.view.borrow_mut();
+            match &mut v.content {
+                Content::Pdf(pv) if same_path(&pv.path, &pos.path) && pos.view == "pdf" => {
+                    pv.restore(&pos);
+                    true
+                }
+                Content::Text(tv) if same_path(&tv.path, &pos.path) && pos.view == "txt" => {
+                    tv.restore(&pos);
+                    true
+                }
+                Content::Md(mv) if same_path(&mv.path, &pos.path) && pos.view == "md" => {
+                    mv.restore(&pos);
+                    true
+                }
+                _ => false,
+            }
+        };
+        if same {
+            self.scroll_cache.set(None);
+            self.invalidate_doc();
+            return;
+        }
+        if is_md_path(&pos.path) {
+            self.md_mode.set(if pos.view == "txt" {
+                MdMode::Raw
+            } else {
+                MdMode::Render
+            });
+        }
+        let path = pos.path.clone();
+        *self.pending_pos.borrow_mut() = Some(pos);
+        self.reveal_in_tree(&path);
+        self.open_file(path, OpenKind::History);
     }
 
     // ───── 세션 (FR-A02, FR-V09) ─────
@@ -1577,7 +2197,14 @@ impl App {
     }
 
     /// 파일별 마지막 위치 (FR-V09). 스크롤 벤치마크는 늘 문서 처음부터 잰다.
-    fn saved_pos(&self, path: &Path) -> Option<session::FilePos> {
+    fn saved_pos(&self, path: &Path) -> Option<FilePos> {
+        // 뒤로/앞으로로 연 문서는 그 기록 위치로
+        {
+            let mut pp = self.pending_pos.borrow_mut();
+            if pp.as_ref().is_some_and(|p| same_path(&p.path, path)) {
+                return pp.take();
+            }
+        }
         if self.bench.borrow().is_some() {
             return None;
         }
@@ -1587,7 +2214,10 @@ impl App {
     fn save_session(&self) {
         self.remember_current();
         let mut s = self.session.borrow_mut();
-        s.root = self.model.borrow().nodes.first().map(|n| n.path.clone());
+        s.root = self.model.borrow().root().map(|n| n.path.clone());
+        s.expanded = self.model.borrow().expanded_paths();
+        s.sidebar_w = Some(self.sidebar_w.get());
+        s.sidebar_hidden = self.sidebar_hidden.get();
         s.open_file = {
             let v = self.view.borrow();
             match &v.content {
@@ -1632,10 +2262,16 @@ impl App {
                 _ => return,
             }
         };
-        self.open_file(path);
+        self.open_file(path, OpenKind::Navigate);
     }
 
-    fn open_file(&self, path: PathBuf) {
+    fn open_file(&self, path: PathBuf, kind: OpenKind) {
+        if kind == OpenKind::Navigate
+            && let Some(cur) = self.current_pos()
+            && !same_path(&cur.path, &path)
+        {
+            self.push_history(cur);
+        }
         self.remember_current();
         let generation = self.doc_gen.get() + 1;
         self.doc_gen.set(generation);
@@ -1652,8 +2288,10 @@ impl App {
         let md_raw = match md_mode {
             MdMode::Raw => true,
             MdMode::Render => false,
-            MdMode::Auto => std::fs::metadata(&path)
-                .is_ok_and(|m| m.len() > leaf_fmt_markdown::RENDER_SIZE_LIMIT),
+            MdMode::Auto => {
+                let limit = self.config.borrow().md_render_limit();
+                std::fs::metadata(&path).is_ok_and(|m| m.len() > limit)
+            }
         };
         match ext.as_str() {
             "pdf" => self.pdf.borrow_mut().open(generation, &path),
@@ -1662,7 +2300,7 @@ impl App {
                 let root = self.model.borrow().nodes.first().map(|n| n.path.clone());
                 let started = Instant::now();
                 self.workers.spawn(move || {
-                    let result = mdload::load(&path, root.as_deref()).map(Box::new);
+                    let result = guarded(|| mdload::load(&path, root.as_deref())).map(Box::new);
                     waker.send(UiMsg::MdLoaded {
                         generation,
                         result,
@@ -1672,9 +2310,10 @@ impl App {
             }
             "txt" | "md" | "markdown" => {
                 let waker = self.waker.clone();
+                let threshold = self.config.borrow().mmap_threshold();
                 self.workers.spawn(move || {
                     let t = Instant::now();
-                    let result = textload::load(&path).map(|l| {
+                    let result = guarded(|| textload::load(&path, threshold)).map(|l| {
                         // 작은 파일은 줄 색인까지 바로 (16MB 미만이라 수 ms)
                         let index = (!l.mapped).then(|| {
                             LineIndex::build(&l.doc, &AtomicBool::new(false), |_| {})
@@ -1721,7 +2360,7 @@ impl App {
             self.pdf.borrow_mut().close();
         }
         if leaving_pdf || leaving_md {
-            self.fill_outline(&[]);
+            self.fill_outline(&[], false);
         }
         if leaving_doc {
             self.hide_bar();
@@ -1788,6 +2427,7 @@ impl App {
                     }
                 }
                 UiMsg::Pdf(ev) => self.on_pdf_event(ev),
+                UiMsg::Watch(ev) => self.on_watch(ev),
                 UiMsg::MdLoaded {
                     generation,
                     result,
@@ -1856,7 +2496,16 @@ impl App {
             human_size(md.size),
         );
         let dwrite = self.view.borrow().renderer.dwrite.clone();
-        let root = self.model.borrow().nodes.first().map(|n| n.path.clone());
+        let root = self.model.borrow().root().map(|n| n.path.clone());
+        let style = {
+            let c = self.config.borrow();
+            MdStyle {
+                font: wide(&c.markdown.font),
+                size_pt: c.markdown.font_size,
+                max_width_em: c.markdown.max_width_em,
+                image_budget: (c.memory.image_cache_mb as usize) << 20,
+            }
+        };
         let mut mv = MdView::new(
             generation,
             path.clone(),
@@ -1865,6 +2514,7 @@ impl App {
             md.sizes,
             md.srcs,
             dwrite,
+            style,
             started,
         );
         {
@@ -1901,35 +2551,15 @@ impl App {
             format!("읽기 {:.0} + 파싱 {:.0}ms", md.read_ms, md.parse_ms);
         self.view.borrow_mut().info = info.clone();
         self.set_status(0, &info);
-        self.fill_outline(&outline);
-        self.expand_outline();
-        self.session.borrow_mut().open_file = Some(path);
+        self.fill_outline(&outline, true);
+        self.doc_opened(path);
     }
 
-    /// MD 목차는 제목 계층을 모두 펼쳐 둔다 (문서 목차처럼 한눈에)
-    fn expand_outline(&self) {
-        let items = self.outline_items.borrow().clone();
-        unsafe {
-            SendMessageW(self.outline, WM_SETREDRAW, Some(WPARAM(0)), None);
-            for it in items {
-                SendMessageW(
-                    self.outline,
-                    TVM_EXPAND,
-                    Some(WPARAM(TVE_EXPAND.0 as usize)),
-                    Some(LPARAM(it.0)),
-                );
-            }
-            SendMessageW(
-                self.outline,
-                TVM_ENSUREVISIBLE,
-                None,
-                Some(LPARAM(
-                    self.outline_items.borrow().first().map_or(0, |i| i.0),
-                )),
-            );
-            SendMessageW(self.outline, WM_SETREDRAW, Some(WPARAM(1)), None);
-            let _ = InvalidateRect(Some(self.outline), None, true);
-        }
+    /// 문서가 화면에 올라온 뒤: 세션·감시 대상·변경 확인용 표식
+    fn doc_opened(&self, path: PathBuf) {
+        self.doc_stamp.set(file_stamp(&path));
+        self.session.borrow_mut().open_file = Some(path);
+        self.update_watch();
     }
 
     fn take_loading(&self, generation: u64) -> Option<(PathBuf, Instant)> {
@@ -1976,7 +2606,7 @@ impl App {
         );
         if is_md_path(&path) {
             // FR-M06: 큰 MD는 원문으로 연다. Ctrl+U로 렌더링
-            info.push_str(if t.size > leaf_fmt_markdown::RENDER_SIZE_LIMIT {
+            info.push_str(if t.size > self.config.borrow().md_render_limit() {
                 " · 큰 MD라 원문 표시 — Ctrl+U: 렌더링"
             } else {
                 " · 원문 — Ctrl+U: 렌더링"
@@ -1985,6 +2615,15 @@ impl App {
         let need_index = t.index.is_none();
         let doc = t.doc.clone();
         let dwrite = self.view.borrow().renderer.dwrite.clone();
+        let style = {
+            let c = self.config.borrow();
+            TextStyle {
+                font: wide(&c.text.font),
+                size_pt: c.text.font_size,
+                tab_width: c.text.tab_width as f32,
+                wrap: c.text.word_wrap,
+            }
+        };
         let mut tv = TextView::new(
             generation,
             path.clone(),
@@ -1992,8 +2631,10 @@ impl App {
             t.size,
             t.index,
             dwrite,
+            style,
             started,
         );
+        tv.mapped = t.mapped;
         if let Some(pos) = self.saved_pos(&path) {
             tv.restore(&pos);
         }
@@ -2003,7 +2644,7 @@ impl App {
         *self.perf_text.borrow_mut() = format!("로드 {:.0}ms", t.load_ms);
         self.view.borrow_mut().info = info.clone();
         self.set_status(0, &info);
-        self.session.borrow_mut().open_file = Some(path);
+        self.doc_opened(path);
         if need_index {
             self.spawn_text_index(generation, doc, cancel);
         }
@@ -2033,6 +2674,15 @@ impl App {
                 } else {
                     format!("로드 {load_ms:.0}")
                 };
+                let (budget, zoom) = {
+                    let c = self.config.borrow();
+                    let zoom = match c.pdf.default_zoom {
+                        ZoomSetting::FitWidth => ZoomMode::FitWidth,
+                        ZoomSetting::FitPage => ZoomMode::FitPage,
+                        ZoomSetting::Percent(z) => ZoomMode::Custom(z),
+                    };
+                    ((c.pdf.bitmap_cache_mb as usize) << 20, zoom)
+                };
                 let mut pv = PdfView::new(
                     generation,
                     path.clone(),
@@ -2040,6 +2690,8 @@ impl App {
                     outline,
                     started,
                     timings,
+                    budget,
+                    zoom,
                 );
                 {
                     let v = self.view.borrow();
@@ -2064,8 +2716,8 @@ impl App {
                 self.set_content(Content::Pdf(Box::new(pv)));
                 self.view.borrow_mut().info = info.clone();
                 self.set_status(0, &info);
-                self.fill_outline(&outline_items);
-                self.session.borrow_mut().open_file = Some(path);
+                self.fill_outline(&outline_items, false);
+                self.doc_opened(path);
             }
             PdfEvent::Tile {
                 generation,
@@ -2215,22 +2867,18 @@ impl App {
             Content::Md(mv) => mv.current_heading(),
             _ => return,
         };
-        if cur == self.outline_current.get() {
-            return;
-        }
-        self.outline_current.set(cur);
-        let item = cur.and_then(|i| self.outline_items.borrow().get(i).copied());
-        if let Some(item) = item {
-            // 프로그램이 바꾼 선택은 TVC_UNKNOWN이라 이동 명령으로 처리되지 않는다
-            unsafe {
-                SendMessageW(
-                    self.outline,
-                    TVM_SELECTITEM,
-                    Some(WPARAM(TVGN_CARET as usize)),
-                    Some(LPARAM(item.0)),
-                );
+        {
+            let mut o = self.outline_data.borrow_mut();
+            if cur == o.current {
+                return;
             }
+            o.current = cur;
         }
+        // 프로그램이 바꾼 선택은 이벤트를 내지 않는다 (이동 명령으로 처리되지 않음)
+        self.outline
+            .st
+            .borrow_mut()
+            .select_key(cur.map(|i| i as isize), true);
     }
 
     fn scroll_metrics(&self) -> Option<ScrollMetrics> {
@@ -2712,7 +3360,11 @@ fn paint(v: &mut DocView, hwnd: HWND) -> Result<PaintOutcome> {
 
     let welcome = if matches!(v.content, Content::Welcome | Content::Message(_)) {
         let (title, body) = match &v.content {
-            Content::Message(m) => (None, m.as_str()),
+            // 오류 화면 (FR-V07): 첫 단락을 제목으로
+            Content::Message(m) => match m.split_once("\n\n") {
+                Some((t, b)) => (Some(t), b),
+                None => (None, m.as_str()),
+            },
             _ => (Some(WELCOME_TITLE), WELCOME_BODY),
         };
         let w = (vw - 4.0 * MARGIN).max(50.0);
@@ -2737,7 +3389,7 @@ fn paint(v: &mut DocView, hwnd: HWND) -> Result<PaintOutcome> {
         t.rt.BeginDraw();
         match &mut v.content {
             Content::Welcome | Content::Message(_) => {
-                t.rt.Clear(Some(&rgb(render::COLOR_BG)));
+                t.rt.Clear(Some(&rgb(t.pal.bg)));
                 let (title, body) = welcome.unwrap();
                 let mut y = 2.0 * MARGIN;
                 if let Some((tl, th)) = title {
@@ -2752,7 +3404,7 @@ fn paint(v: &mut DocView, hwnd: HWND) -> Result<PaintOutcome> {
                 render::draw_layout(t, &body.0, 2.0 * MARGIN, y, brush);
             }
             Content::Text(tv) => {
-                t.rt.Clear(Some(&rgb(render::COLOR_BG)));
+                t.rt.Clear(Some(&rgb(t.pal.bg)));
                 tv.set_view(vw, vh);
                 let first = tv.first_paint_ms.is_none();
                 let r = tv.paint(t);
@@ -2772,7 +3424,7 @@ fn paint(v: &mut DocView, hwnd: HWND) -> Result<PaintOutcome> {
                 out.status = Some(format!("{} · {}", pv.status(), pv.timings));
             }
             Content::Md(mv) => {
-                t.rt.Clear(Some(&rgb(render::COLOR_BG)));
+                t.rt.Clear(Some(&rgb(t.pal.bg)));
                 mv.set_view(vw, vh, dpi);
                 let first = mv.first_paint_ms.is_none();
                 out.md_cmds = mv.paint(t);
@@ -2790,34 +3442,148 @@ fn paint(v: &mut DocView, hwnd: HWND) -> Result<PaintOutcome> {
 
 // ───────────────────────── 창 프로시저 ─────────────────────────
 
-extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+/// 창 프로시저 본문의 패닉을 잡는다: 기록은 패닉 훅이 하고, 복구(오류 화면)는 메시지로 미룬다.
+fn guarded_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    f: impl FnOnce(&App) -> LRESULT,
+) -> LRESULT {
     let Some(app) = app_of(hwnd) else {
         return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
     };
-    unsafe {
+    match catch_unwind(AssertUnwindSafe(|| f(app))) {
+        Ok(r) => r,
+        Err(_) => {
+            unsafe {
+                let _ = PostMessageW(Some(app.hwnd), WM_APP_PANIC, WPARAM(0), LPARAM(0));
+                if msg == WM_PAINT {
+                    // 그리다 멈췄으면 무효 영역을 비워 같은 패닉이 반복되지 않게 한다
+                    let _ = ValidateRect(Some(hwnd), None);
+                }
+            }
+            LRESULT(0)
+        }
+    }
+}
+
+impl App {
+    /// 패닉 뒤 복구: 문서를 내려놓고 오류 화면을 띄운다 (FR-V07)
+    fn recover_from_panic(&self) {
+        if let Ok(mut v) = self.view.try_borrow_mut() {
+            v.renderer.discard_target();
+            v.loading = None;
+        }
+        let dir = log_dir()
+            .map(|d| d.join("crash.log").display().to_string())
+            .unwrap_or_default();
+        self.set_content(Content::Message(format!(
+            "내부 오류가 발생했습니다.\n\n문서를 닫았습니다. 다른 파일을 열어 계속할 수 있습니다.\n기록: {dir}"
+        )));
+        self.set_status(1, "내부 오류 — 문서를 닫았습니다");
+    }
+
+    fn on_copydata(&self, lparam: LPARAM) -> LRESULT {
+        let cds = unsafe { &*(lparam.0 as *const COPYDATASTRUCT) };
+        if cds.dwData != COPYDATA_OPEN {
+            return LRESULT(0);
+        }
+        let n = cds.cbData as usize / 2;
+        let text = if n == 0 || cds.lpData.is_null() {
+            String::new()
+        } else {
+            String::from_utf16_lossy(unsafe {
+                std::slice::from_raw_parts(cds.lpData as *const u16, n)
+            })
+        };
+        if !text.is_empty() {
+            *self.pending_reveal.borrow_mut() = None;
+            let p = PathBuf::from(text);
+            self.open_path(&p);
+        }
+        LRESULT(1)
+    }
+}
+
+extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    guarded_proc(hwnd, msg, wparam, lparam, |app| unsafe {
         match msg {
             WM_SIZE => {
                 app.layout();
                 LRESULT(0)
             }
+            WM_ERASEBKGND => {
+                // 사이드바와 문서 사이 틈 (폭 조절 손잡이)
+                let hdc = HDC(wparam.0 as *mut c_void);
+                let mut rc = RECT::default();
+                let _ = GetClientRect(hwnd, &mut rc);
+                let p = theme::current();
+                FillRect(hdc, &rc, theme::brush(p.side_bg));
+                if !app.sidebar_hidden.get() {
+                    let x = app.side_px(rc.right) + scale(SPLIT_DIP, app.dpi()) - 1;
+                    let line = RECT {
+                        left: x,
+                        top: 0,
+                        right: x + 1,
+                        bottom: rc.bottom,
+                    };
+                    FillRect(hdc, &line, theme::brush(p.splitter));
+                }
+                LRESULT(1)
+            }
             WM_SETFOCUS => {
-                let _ = SetFocus(Some(app.tree));
+                let _ = SetFocus(Some(if app.sidebar_hidden.get() {
+                    app.doc
+                } else {
+                    app.current_list().hwnd
+                }));
                 LRESULT(0)
             }
-            WM_NOTIFY => {
-                let hdr = &*(lparam.0 as *const NMHDR);
-                if hdr.hwndFrom == app.tree {
-                    return app.on_tree_notify(lparam);
-                }
-                if hdr.hwndFrom == app.outline {
-                    return app.on_outline_notify(lparam);
-                }
-                if hdr.hwndFrom == app.tabs && hdr.code == TCN_SELCHANGE {
-                    let i = SendMessageW(app.tabs, TCM_GETCURSEL, None, None).0.max(0) as usize;
-                    app.select_tab(i);
-                    return LRESULT(0);
+            WM_SETCURSOR
+                if loword(lparam.0 as usize) == HTCLIENT && wparam.0 == hwnd.0 as usize =>
+            {
+                let mut pt = POINT::default();
+                let _ = GetCursorPos(&mut pt);
+                let _ = ScreenToClient(hwnd, &mut pt);
+                if app.in_splitter(pt.x) || app.split_drag.get().is_some() {
+                    if let Ok(c) = LoadCursorW(None, IDC_SIZEWE) {
+                        SetCursor(Some(c));
+                    }
+                    return LRESULT(1);
                 }
                 DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
+            WM_LBUTTONDOWN => {
+                let x = loword(lparam.0 as usize) as u16 as i16 as i32;
+                if app.in_splitter(x) {
+                    let mut rc = RECT::default();
+                    let _ = GetClientRect(hwnd, &mut rc);
+                    app.split_drag.set(Some(x - app.side_px(rc.right)));
+                    SetCapture(hwnd);
+                }
+                LRESULT(0)
+            }
+            WM_MOUSEMOVE => {
+                if let Some(off) = app.split_drag.get() {
+                    let x = loword(lparam.0 as usize) as u16 as i16 as i32;
+                    let dpi = app.dpi();
+                    let mut rc = RECT::default();
+                    let _ = GetClientRect(hwnd, &mut rc);
+                    let px = (x - off).clamp(
+                        scale(SIDEBAR_MIN_DIP, dpi),
+                        (rc.right - scale(200, dpi)).max(0),
+                    );
+                    app.sidebar_w.set((px as i64 * 96 / dpi as i64) as i32);
+                    app.layout();
+                }
+                LRESULT(0)
+            }
+            WM_LBUTTONUP | WM_CAPTURECHANGED => {
+                if app.split_drag.take().is_some() && msg == WM_LBUTTONUP {
+                    let _ = ReleaseCapture();
+                }
+                LRESULT(0)
             }
             WM_TIMER => {
                 match wparam.0 {
@@ -2829,12 +3595,17 @@ extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
                     }
                     TIMER_FIND => app.start_search(),
                     TIMER_BENCH => app.bench_tick(),
+                    TIMER_WATCH => app.flush_watch(),
                     _ => {}
                 }
                 LRESULT(0)
             }
             WM_APP_WAKE => {
                 app.drain_messages();
+                LRESULT(0)
+            }
+            WM_APP_PANIC => {
+                app.recover_from_panic();
                 LRESULT(0)
             }
             WM_APP_BAR => {
@@ -2847,9 +3618,44 @@ extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
                 app.on_bar_event(ev);
                 LRESULT(0)
             }
+            WM_APP_TAB => {
+                app.select_tab(wparam.0);
+                let _ = SetFocus(Some(app.current_list().hwnd));
+                LRESULT(0)
+            }
+            // 마우스 X1/X2 버튼·키보드 브라우저 키 → 뒤로/앞으로 (FR-V02)
+            WM_APPCOMMAND => {
+                let cmd = hiword(lparam.0 as usize) & !0xF000;
+                match cmd {
+                    // APPCOMMAND_BROWSER_BACKWARD / FORWARD / REFRESH
+                    1 => app.go_history(true),
+                    2 => app.go_history(false),
+                    3 => {
+                        app.relist_all();
+                        app.reload_doc();
+                    }
+                    _ => return DefWindowProcW(hwnd, msg, wparam, lparam),
+                }
+                LRESULT(1)
+            }
             WM_COMMAND if loword(wparam.0) as usize == ID_OPEN_FOLDER => {
                 app.pick_folder();
                 LRESULT(0)
+            }
+            WM_COPYDATA => app.on_copydata(lparam),
+            WM_SETTINGCHANGE => {
+                // Windows 앱 모드(라이트/다크)가 바뀜
+                if lparam.0 != 0 {
+                    let s = PCWSTR(lparam.0 as *const u16)
+                        .to_string()
+                        .unwrap_or_default();
+                    if s == "ImmersiveColorSet"
+                        && app.config.borrow().general.theme == Theme::System
+                    {
+                        app.apply_theme();
+                    }
+                }
+                DefWindowProcW(hwnd, msg, wparam, lparam)
             }
             WM_DROPFILES => {
                 let hdrop = HDROP(wparam.0 as *mut c_void);
@@ -2893,14 +3699,33 @@ extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
             }
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
         }
-    }
+    })
+}
+
+/// 사이드바 목록(파일 트리·목차) 창
+extern "system" fn list_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    guarded_proc(hwnd, msg, wparam, lparam, |app| {
+        let is_files = hwnd == app.files.hwnd;
+        let list = if is_files { &app.files } else { &app.outline };
+        let mut events = Vec::new();
+        // SetScrollInfo 등으로 재진입하면(이미 빌림) 기본 처리에 맡긴다
+        let handled = match (list.st.try_borrow_mut(), app.fonts.try_borrow()) {
+            (Ok(mut st), Ok(fonts)) => st.on_msg(msg, wparam, lparam, &fonts, &mut events),
+            _ => None,
+        };
+        for ev in events {
+            if is_files {
+                app.on_files_event(ev);
+            } else {
+                app.on_outline_event(ev);
+            }
+        }
+        handled.unwrap_or_else(|| unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) })
+    })
 }
 
 extern "system" fn doc_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    let Some(app) = app_of(hwnd) else {
-        return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
-    };
-    unsafe {
+    guarded_proc(hwnd, msg, wparam, lparam, |app| unsafe {
         match msg {
             WM_PAINT => {
                 let mut ps = PAINTSTRUCT::default();
@@ -2971,5 +3796,5 @@ extern "system" fn doc_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             }
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
         }
-    }
+    })
 }

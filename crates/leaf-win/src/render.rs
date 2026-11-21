@@ -10,6 +10,8 @@ use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 use windows::core::{Result, w};
 use windows_numerics::Vector2;
 
+use crate::theme::{self, Palette};
+
 pub fn rgb(hex: u32) -> D2D1_COLOR_F {
     D2D1_COLOR_F {
         r: ((hex >> 16) & 0xFF) as f32 / 255.0,
@@ -23,22 +25,10 @@ pub fn rgba(hex: u32, a: f32) -> D2D1_COLOR_F {
     D2D1_COLOR_F { a, ..rgb(hex) }
 }
 
-pub const COLOR_BG: u32 = 0xFFFFFF;
-pub const COLOR_TEXT: u32 = 0x1F1F1F;
-pub const COLOR_DIM: u32 = 0x6B6B6B;
-pub const COLOR_PDF_BG: u32 = 0xE6E6E6;
-pub const COLOR_PLACEHOLDER: u32 = 0xF7F7F7;
-pub const COLOR_LINK: u32 = 0x0969DA;
-pub const COLOR_CODE_BG: u32 = 0xF6F8FA;
-pub const COLOR_BORDER: u32 = 0xD0D7DE;
-
-/// GPU 렌더 타깃 사용 여부. 설정 파일(§8)이 생기면 `[general] gpu`로 대체한다.
-fn use_gpu() -> bool {
-    std::env::var_os("LEAF_D2D_GPU").is_some_and(|v| v == "1")
-}
-
 pub struct Target {
     pub rt: ID2D1HwndRenderTarget,
+    /// 이 타깃을 만들 때의 테마 색 (테마가 바뀌면 타깃을 다시 만든다)
+    pub pal: Palette,
     pub text: ID2D1SolidColorBrush,
     pub dim: ID2D1SolidColorBrush,
     pub placeholder: ID2D1SolidColorBrush,
@@ -64,6 +54,8 @@ pub struct Renderer {
     target: Option<Target>,
     epoch: u64,
     dpi: f32,
+    /// SPEC §12 Q8: 기본은 소프트웨어 렌더 타깃. 설정 `[general] gpu = true`면 하드웨어
+    gpu: bool,
 }
 
 fn text_format(
@@ -86,7 +78,7 @@ fn text_format(
 }
 
 impl Renderer {
-    pub fn new(dpi: u32) -> Result<Self> {
+    pub fn new(dpi: u32, gpu: bool) -> Result<Self> {
         unsafe {
             let d2d: ID2D1Factory1 = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
             let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
@@ -100,6 +92,7 @@ impl Renderer {
                 target: None,
                 epoch: 0,
                 dpi: dpi as f32,
+                gpu: gpu || std::env::var_os("LEAF_D2D_GPU").is_some_and(|v| v == "1"),
             })
         }
     }
@@ -127,7 +120,14 @@ impl Renderer {
         }
     }
 
-    /// 창 최소화 등에서 디바이스 리소스를 비운다 (SPEC §4.5).
+    pub fn set_gpu(&mut self, gpu: bool) {
+        if gpu != self.gpu {
+            self.gpu = gpu;
+            self.target = None;
+        }
+    }
+
+    /// 창 최소화·테마 변경 등에서 디바이스 리소스를 비운다 (SPEC §4.5).
     pub fn discard_target(&mut self) {
         self.target = None;
     }
@@ -144,8 +144,8 @@ impl Renderer {
                 dpiX: self.dpi,
                 dpiY: self.dpi,
                 // SPEC §12 Q8: 소프트웨어가 기본 (GPU 드라이버 DLL 로딩 비용 회피, G1).
-                // GPU는 설정 `[general] gpu = true`(설정 파일 구현 전까지는 LEAF_D2D_GPU=1)로 켠다.
-                r#type: if use_gpu() {
+                // GPU는 설정 `[general] gpu = true`(또는 환경 변수 LEAF_D2D_GPU=1)로 켠다.
+                r#type: if self.gpu {
                     D2D1_RENDER_TARGET_TYPE_DEFAULT
                 } else {
                     D2D1_RENDER_TARGET_TYPE_SOFTWARE
@@ -162,20 +162,24 @@ impl Renderer {
             };
             unsafe {
                 let rt = self.d2d.CreateHwndRenderTarget(&props, &hprops)?;
-                let text = rt.CreateSolidColorBrush(&rgb(COLOR_TEXT), None)?;
-                let dim = rt.CreateSolidColorBrush(&rgb(COLOR_DIM), None)?;
-                let placeholder = rt.CreateSolidColorBrush(&rgb(COLOR_PLACEHOLDER), None)?;
-                let page_border = rt.CreateSolidColorBrush(&rgb(0xC8C8C8), None)?;
-                let hit = rt.CreateSolidColorBrush(&rgba(0xFFD400, 0.40), None)?;
-                let hit_current = rt.CreateSolidColorBrush(&rgba(0xFF7A00, 0.55), None)?;
-                let selection = rt.CreateSolidColorBrush(&rgba(0x2F7BFF, 0.30), None)?;
-                let link = rt.CreateSolidColorBrush(&rgb(COLOR_LINK), None)?;
-                let code_bg = rt.CreateSolidColorBrush(&rgb(COLOR_CODE_BG), None)?;
-                let border = rt.CreateSolidColorBrush(&rgb(COLOR_BORDER), None)?;
-                let inline_code = rt.CreateSolidColorBrush(&rgba(0x818B98, 0.18), None)?;
+                let p = theme::current();
+                let solid = |c: u32| rt.CreateSolidColorBrush(&rgb(c), None);
+                let alpha = |(c, a): (u32, f32)| rt.CreateSolidColorBrush(&rgba(c, a), None);
+                let text = solid(p.text)?;
+                let dim = solid(p.dim)?;
+                let placeholder = solid(p.placeholder)?;
+                let page_border = solid(p.page_border)?;
+                let hit = alpha(p.hit)?;
+                let hit_current = alpha(p.hit_current)?;
+                let selection = alpha(p.selection)?;
+                let link = solid(p.link)?;
+                let code_bg = solid(p.code_bg)?;
+                let border = solid(p.border)?;
+                let inline_code = alpha(p.inline_code)?;
                 self.epoch += 1;
                 self.target = Some(Target {
                     rt,
+                    pal: p,
                     text,
                     dim,
                     placeholder,

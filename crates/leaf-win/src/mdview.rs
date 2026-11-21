@@ -22,7 +22,7 @@ use windows::Win32::Graphics::Direct2D::{
     D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, ID2D1Bitmap, ID2D1SolidColorBrush,
 };
 use windows::Win32::Graphics::DirectWrite::*;
-use windows::core::{BOOL, IUnknown, Interface, Ref, Result, implement, w};
+use windows::core::{BOOL, IUnknown, Interface, PCWSTR, Ref, Result, implement, w};
 
 use crate::mdload::{self, DecodedImage, ImgSrc, Target as LinkTarget};
 use crate::pdfview::CursorKind;
@@ -30,13 +30,21 @@ use crate::render::{self, Target};
 use crate::textview::range_rects;
 
 /// 본문 최대 폭(em), 가운데 정렬 (FR-M10, 설정 `[markdown] max_width_em`)
-const MAX_WIDTH_EM: f32 = 50.0;
+/// MD 보기 서식 (설정 `[markdown]`·`[memory]`, FR-M10)
+#[derive(Clone, Debug, PartialEq)]
+pub struct MdStyle {
+    /// NUL로 끝나는 UTF-16 본문 글꼴 이름
+    pub font: Vec<u16>,
+    /// 본문 크기(pt). 레이아웃 기준(11pt) 대비 비율을 배율에 곱한다
+    pub size_pt: f32,
+    pub max_width_em: f32,
+    pub image_budget: usize,
+}
 /// 좌우 최소 여백(em)
 const SIDE_EM: f32 = 2.0;
 const ZOOM_MIN: f32 = 0.5;
 const ZOOM_MAX: f32 = 3.0;
 /// MD 이미지 비트맵 캐시 예산 (SPEC §4.5, 설정 `[memory] image_cache_mb`)
-const IMAGE_BUDGET: usize = 32 << 20;
 pub const MAX_HITS: usize = 10_000;
 
 pub enum MdCmd {
@@ -54,6 +62,8 @@ pub enum MdCmd {
     /// 지원하지 않는 로컬 파일: 실행하지 않고 탐색기에서 보기만 (§6.3)
     Reveal(PathBuf),
     Status(String),
+    /// 문서 안 앵커로 이동했다: 이동 전 위치를 뒤로 가기 기록에 (FR-V02)
+    Jumped(FilePos),
 }
 
 // ───────────────────────── DirectWrite 측정기 ─────────────────────────
@@ -162,14 +172,16 @@ impl DwPara {
 
 pub struct DwMeasurer {
     dw: IDWriteFactory,
+    family: Vec<u16>,
     zoom: f32,
     formats: HashMap<ParaKind, IDWriteTextFormat>,
 }
 
 impl DwMeasurer {
-    pub fn new(dw: IDWriteFactory) -> Self {
+    pub fn new(dw: IDWriteFactory, family: Vec<u16>) -> Self {
         Self {
             dw,
+            family,
             zoom: 1.0,
             formats: HashMap::new(),
         }
@@ -180,12 +192,11 @@ impl DwMeasurer {
             return Ok(f.clone());
         }
         let size = font_size(kind, self.zoom);
+        let body = PCWSTR(self.family.as_ptr());
         let (family, weight) = match kind {
             ParaKind::Code => (w!("Consolas"), DWRITE_FONT_WEIGHT_NORMAL),
-            ParaKind::Heading(_) | ParaKind::TableHead => {
-                (w!("Segoe UI"), DWRITE_FONT_WEIGHT_SEMI_BOLD)
-            }
-            _ => (w!("Segoe UI"), DWRITE_FONT_WEIGHT_NORMAL),
+            ParaKind::Heading(_) | ParaKind::TableHead => (body, DWRITE_FONT_WEIGHT_SEMI_BOLD),
+            _ => (body, DWRITE_FONT_WEIGHT_NORMAL),
         };
         unsafe {
             let f = self.dw.CreateTextFormat(
@@ -377,6 +388,9 @@ struct MdSearch {
 pub struct MdView {
     pub generation: u64,
     pub path: PathBuf,
+    style: MdStyle,
+    /// 글꼴 크기 설정 / 레이아웃 기준 크기
+    base: f32,
     root: Option<PathBuf>,
     flow: FlowLayout<DwMeasurer>,
     srcs: Vec<ImgSrc>,
@@ -408,9 +422,15 @@ impl MdView {
         sizes: Vec<ImgSize>,
         srcs: Vec<ImgSrc>,
         dwrite: IDWriteFactory,
+        style: MdStyle,
         opened_at: Instant,
     ) -> Self {
-        let mut flow = FlowLayout::new(content, DwMeasurer::new(dwrite.clone()), 1.0);
+        let base = (style.size_pt / leaf_layout::flow::BASE_PT).clamp(0.3, 5.0);
+        let mut flow = FlowLayout::new(
+            content,
+            DwMeasurer::new(dwrite.clone(), style.font.clone()),
+            base,
+        );
         for (i, s) in sizes.into_iter().enumerate() {
             flow.set_image_size(i as ImageId, s);
         }
@@ -420,7 +440,9 @@ impl MdView {
             root,
             flow,
             srcs,
-            bitmaps: BudgetLru::new(IMAGE_BUDGET),
+            bitmaps: BudgetLru::new(style.image_budget),
+            base,
+            style,
             pending: HashSet::new(),
             epoch: 0,
             dwrite,
@@ -509,7 +531,7 @@ impl MdView {
     fn content_box(&self) -> (f32, f32) {
         let em = self.em();
         let cw = (self.vw - 2.0 * SIDE_EM * em)
-            .min(MAX_WIDTH_EM * em)
+            .min(self.style.max_width_em * em)
             .max(4.0 * em);
         (cw, ((self.vw - cw) * 0.5).max(0.0))
     }
@@ -566,12 +588,17 @@ impl MdView {
 
     // ───── 배율 ─────
 
+    /// 사용자 배율 (글꼴 크기 설정 비율 제외)
+    fn zoom(&self) -> f32 {
+        self.flow.zoom() / self.base
+    }
+
     pub fn zoom_by(&mut self, f: f32) {
-        self.set_zoom(self.flow.zoom() * f);
+        self.set_zoom(self.zoom() * f);
     }
 
     pub fn set_zoom(&mut self, z: f32) {
-        self.flow.set_zoom(z.clamp(ZOOM_MIN, ZOOM_MAX));
+        self.flow.set_zoom(z.clamp(ZOOM_MIN, ZOOM_MAX) * self.base);
         self.alt_format = None;
     }
 
@@ -583,9 +610,10 @@ impl MdView {
             path: self.path.clone(),
             page: u as u32,
             y_pt: off,
-            zoom: format!("{:.4}", self.flow.zoom()),
+            zoom: format!("{:.4}", self.zoom()),
             offset: 0,
             view: "md".into(),
+            wrap: None,
         }
     }
 
@@ -606,7 +634,7 @@ impl MdView {
         } else {
             100.0
         };
-        let mut s = format!("{pct:.0}% · {:.0}%", self.flow.zoom() * 100.0);
+        let mut s = format!("{pct:.0}% · {:.0}%", self.zoom() * 100.0);
         if let Some(f) = self.search_status() {
             s.push_str(" · ");
             s.push_str(&f);
@@ -795,22 +823,24 @@ impl MdView {
     /// 링크 따라가기 (FR-M04)
     pub fn follow(&mut self, href: &str) -> Vec<MdCmd> {
         let base = self.path.parent().unwrap_or(Path::new(""));
+        let before = self.position();
         match mdload::resolve(base, self.root.as_deref(), href) {
             LinkTarget::Anchor(a) => {
                 if self.go_anchor(&a) {
-                    Vec::new()
+                    vec![MdCmd::Jumped(before)]
                 } else {
                     vec![MdCmd::Status(format!("문서에 없는 앵커: #{a}"))]
                 }
             }
             LinkTarget::Local(p, anchor) => {
                 if same_file(&p, &self.path) {
-                    if let Some(a) = anchor
-                        && !self.go_anchor(&a)
-                    {
-                        return vec![MdCmd::Status(format!("문서에 없는 앵커: #{a}"))];
-                    }
-                    return Vec::new();
+                    return match anchor {
+                        Some(a) if !self.go_anchor(&a) => {
+                            vec![MdCmd::Status(format!("문서에 없는 앵커: #{a}"))]
+                        }
+                        Some(_) => vec![MdCmd::Jumped(before)],
+                        None => Vec::new(),
+                    };
                 }
                 let supported = p
                     .extension()
@@ -895,7 +925,7 @@ impl MdView {
             self.alt_format = unsafe {
                 self.dwrite
                     .CreateTextFormat(
-                        w!("Segoe UI"),
+                        PCWSTR(self.style.font.as_ptr()),
                         None,
                         DWRITE_FONT_WEIGHT_NORMAL,
                         DWRITE_FONT_STYLE_NORMAL,

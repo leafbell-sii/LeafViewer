@@ -4,13 +4,16 @@
 use std::ffi::c_void;
 
 use windows::Win32::Foundation::*;
-use windows::Win32::Graphics::Gdi::{COLOR_BTNFACE, HBRUSH, HFONT};
+use windows::Win32::Graphics::Gdi::{
+    FillRect, HDC, HFONT, InvalidateRect, SetBkColor, SetTextColor,
+};
 use windows::Win32::UI::Controls::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, Result, w};
 
+use crate::theme;
 use crate::util::{scale, wide};
 
 pub const BAR_CLASS: PCWSTR = w!("LeafViewer.Bar");
@@ -19,7 +22,10 @@ pub const BAR_HEIGHT_DIP: i32 = 36;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BarMode {
     Find,
+    /// PDF 쪽 이동
     Goto,
+    /// TXT 줄 이동
+    GotoLine,
 }
 
 /// 막대에서 앱으로 올라가는 이벤트. 막대의 부모(메인 창)에 WM_APP_BAR로 보낸다.
@@ -51,7 +57,6 @@ impl Bar {
                 lpfnWndProc: Some(bar_proc),
                 hInstance: hinst,
                 hCursor: LoadCursorW(None, IDC_ARROW)?,
-                hbrBackground: HBRUSH((COLOR_BTNFACE.0 + 1) as usize as *mut c_void),
                 lpszClassName: BAR_CLASS,
                 ..Default::default()
             };
@@ -152,6 +157,7 @@ impl Bar {
         let (label, cue) = match mode {
             BarMode::Find => ("찾기", "문서에서 찾기 (Enter 다음, Shift+Enter 이전)"),
             BarMode::Goto => ("쪽 이동", "쪽 번호 입력 후 Enter"),
+            BarMode::GotoLine => ("줄 이동", "줄 번호 입력 후 Enter"),
         };
         let l = wide(label);
         let c = wide(cue);
@@ -189,6 +195,13 @@ impl Bar {
         }
     }
 
+    pub fn apply_theme(&self, dark: bool) {
+        theme::apply_edit_theme(self.edit, dark);
+        unsafe {
+            let _ = InvalidateRect(Some(self.hwnd), None, true);
+        }
+    }
+
     pub fn focus_select_all(&self) {
         unsafe {
             let _ = SetFocus(Some(self.edit));
@@ -199,6 +212,28 @@ impl Bar {
 
 extern "system" fn bar_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
+        let p = theme::current();
+        match msg {
+            WM_ERASEBKGND => {
+                let mut rc = RECT::default();
+                let _ = GetClientRect(hwnd, &mut rc);
+                FillRect(HDC(wparam.0 as *mut c_void), &rc, theme::brush(p.bar_bg));
+                return LRESULT(1);
+            }
+            // 테마 색 (FR-A03)
+            WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT => {
+                let hdc = HDC(wparam.0 as *mut c_void);
+                let edit = msg == WM_CTLCOLOREDIT;
+                SetTextColor(
+                    hdc,
+                    theme::colorref(if edit { p.text } else { p.side_text }),
+                );
+                let bg = if edit { p.edit_bg } else { p.bar_bg };
+                SetBkColor(hdc, theme::colorref(bg));
+                return LRESULT(theme::brush(bg).0 as isize);
+            }
+            _ => {}
+        }
         if msg == WM_COMMAND && (wparam.0 >> 16) as u32 == EN_CHANGE {
             if let Ok(parent) = GetParent(hwnd) {
                 let _ = PostMessageW(

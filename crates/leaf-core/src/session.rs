@@ -15,6 +15,12 @@ pub struct Session {
     pub window: Option<WindowState>,
     /// 최근 연 파일 위치. 앞쪽이 최신.
     pub recent: Vec<FilePos>,
+    /// 사이드바 폭(DIP). 없으면 기본값 (FR-A05)
+    pub sidebar_w: Option<i32>,
+    /// Ctrl+B로 사이드바를 접어 두었는지
+    pub sidebar_hidden: bool,
+    /// 펼쳐 둔 폴더 (FR-A02). 루트 아래 절대 경로
+    pub expanded: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
@@ -42,6 +48,8 @@ pub struct FilePos {
     /// 이 위치를 기록한 보기: "pdf" | "txt" | "md". MD는 원문(TXT) 보기로도 열 수 있어
     /// 다른 보기의 위치를 잘못 해석하지 않도록 구분한다 (빈 값 = 이전 버전 세션).
     pub view: String,
+    /// TXT 자동 줄바꿈 (FR-T03). 없으면 설정값
+    pub wrap: Option<bool>,
 }
 
 pub fn default_path() -> Option<PathBuf> {
@@ -104,6 +112,9 @@ mod tests {
                 maximized: true,
             }),
             recent: vec![],
+            sidebar_w: Some(300),
+            sidebar_hidden: true,
+            expanded: vec![PathBuf::from(r"C:\Docs\sub")],
         };
         for i in 0..(MAX_RECENT + 5) {
             s.remember(FilePos {
@@ -113,6 +124,7 @@ mod tests {
                 zoom: "fit-width".into(),
                 offset: i as u64,
                 view: "pdf".into(),
+                wrap: None,
             });
         }
         s.remember(FilePos {

@@ -83,46 +83,56 @@ pub(crate) fn run(lib: PathBuf, rx: Receiver<Req>, notify: Notify) {
             continue;
         }
         let t = Instant::now();
-        match pdfium.load_pdf_from_file(&path, None) {
-            Ok(doc) => {
-                let page_sizes: Vec<(f32, f32)> = doc
-                    .pages()
-                    .page_sizes()
-                    .unwrap_or_default()
-                    .iter()
-                    .map(|r| (r.width().value, r.height().value))
-                    .collect();
-                let load_ms = ms(t);
-                let outline = read_outline(&doc, &page_sizes);
-                notify(PdfEvent::Opened {
-                    generation,
-                    page_sizes: page_sizes.clone(),
-                    outline,
-                    bind_ms,
-                    load_ms,
-                });
-                bind_ms = 0.0;
-                match serve(&doc, generation, &page_sizes, &rx, &notify) {
-                    Next::Open(r) => next = Some(r),
-                    Next::Idle => {}
-                    Next::Quit => return,
+        // PDFium 래퍼의 패닉은 이 문서만 실패로 돌리고 스레드는 살린다 (§6.2, FR-V07)
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            match pdfium.load_pdf_from_file(&path, None) {
+                Ok(doc) => {
+                    let page_sizes: Vec<(f32, f32)> = doc
+                        .pages()
+                        .page_sizes()
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|r| (r.width().value, r.height().value))
+                        .collect();
+                    let load_ms = ms(t);
+                    let outline = read_outline(&doc, &page_sizes);
+                    notify(PdfEvent::Opened {
+                        generation,
+                        page_sizes: page_sizes.clone(),
+                        outline,
+                        bind_ms,
+                        load_ms,
+                    });
+                    bind_ms = 0.0;
+                    serve(&doc, generation, &page_sizes, &rx, &notify)
+                }
+                Err(e) => {
+                    let password = matches!(
+                        e,
+                        PdfiumError::PdfiumLibraryInternalError(PdfiumInternalError::PasswordError)
+                    );
+                    notify(PdfEvent::Error {
+                        generation,
+                        message: if password {
+                            "암호로 보호된 PDF입니다. (암호 입력은 아직 지원하지 않습니다)".into()
+                        } else {
+                            format!("PDF를 열 수 없습니다: {e}")
+                        },
+                        password,
+                    });
+                    Next::Idle
                 }
             }
-            Err(e) => {
-                let password = matches!(
-                    e,
-                    PdfiumError::PdfiumLibraryInternalError(PdfiumInternalError::PasswordError)
-                );
-                notify(PdfEvent::Error {
-                    generation,
-                    message: if password {
-                        "암호로 보호된 PDF입니다. (암호 입력은 아직 지원하지 않습니다)".into()
-                    } else {
-                        format!("PDF를 열 수 없습니다: {e}")
-                    },
-                    password,
-                });
-            }
+        }));
+        match outcome {
+            Ok(Next::Open(r)) => next = Some(r),
+            Ok(Next::Idle) => {}
+            Ok(Next::Quit) => return,
+            Err(_) => notify(PdfEvent::Error {
+                generation,
+                message: "PDF를 여는 중 내부 오류가 발생했습니다".into(),
+                password: false,
+            }),
         }
     }
 }

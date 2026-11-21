@@ -1,11 +1,14 @@
 //! LeafViewer 코어 — UI 비의존 순수 Rust (SPEC §3.1, §4.1).
 #![forbid(unsafe_code)]
 
+pub mod config;
 pub mod fs_tree;
 pub mod lru;
 pub mod natural;
 pub mod perf;
 pub mod session;
+pub mod tree;
+pub mod watch;
 pub mod worker;
 
 /// v1 기본 지원 확장자. M1 이후 포맷 레지스트리(§4.3)로 대체된다.
