@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 
 pub mod config;
+pub mod format;
 pub mod fs_tree;
 pub mod lru;
 pub mod natural;
@@ -11,12 +12,7 @@ pub mod tree;
 pub mod watch;
 pub mod worker;
 
-/// v1 기본 지원 확장자. M1 이후 포맷 레지스트리(§4.3)로 대체된다.
-pub const SUPPORTED_EXTENSIONS: &[&str] = &["pdf", "md", "markdown", "txt"];
-
-/// 확장자(소문자, 점 제외)로 지원 여부 판정.
+/// 확장자(점 제외, 대소문자 무시)로 지원 여부 판정 — 설치된 포맷 레지스트리(§4.3)에 묻는다.
 pub fn is_supported_ext(ext: &str) -> bool {
-    SUPPORTED_EXTENSIONS
-        .iter()
-        .any(|e| e.eq_ignore_ascii_case(ext))
+    format::registry().by_ext(ext).is_some()
 }

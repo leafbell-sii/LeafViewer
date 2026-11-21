@@ -5,6 +5,7 @@
 //! 어떤 RefCell 빌림도 들고 있지 않는다.** 보기들은 요청을 `Cmd`로 돌려주고, 빌림을 놓은 뒤 처리한다.
 //! 창 프로시저의 패닉은 잡아서 오류 화면으로 바꾼다 (FR-V07, §6.2).
 
+use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::ffi::{OsStr, OsString, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -22,6 +23,7 @@ use leaf_core::tree::{LoadState, TreeModel, VisRow};
 use leaf_core::watch::{WatchEvent, Watcher};
 use leaf_core::worker::WorkerPool;
 use leaf_doc::Dest;
+use leaf_doc::format::ViewKind;
 use leaf_doc::paged::ZoomMode;
 use leaf_fmt_pdf::{PdfEngine, PdfEvent};
 use leaf_fmt_text::search::Hit;
@@ -46,6 +48,8 @@ use windows::core::{PCWSTR, Result, w};
 use crate::StartOptions;
 use crate::bar::{BAR_HEIGHT_DIP, Bar, BarEvent, BarMode, WM_APP_BAR};
 use crate::chrome::{self, Strip, StripKind, WM_APP_TAB};
+use crate::custom::{CustomCmd, CustomView, OpenCtx};
+use crate::formats;
 use crate::mdload::{self, DecodedImage, LoadedMd};
 use crate::mdview::{MdCmd, MdStyle, MdView};
 use crate::pdfview::{self, Cmd, CursorKind, PdfView};
@@ -131,6 +135,23 @@ enum UiMsg {
         result: std::result::Result<DecodedImage, String>,
     },
     Watch(WatchEvent),
+    /// 확장자로 모르는 파일의 앞부분을 읽어 판별한 결과 (§4.3 sniff)
+    Sniffed {
+        generation: u64,
+        path: PathBuf,
+        format: Option<&'static str>,
+    },
+    /// 전용 보기 포맷(`CustomFormat::load`) 결과
+    CustomLoaded {
+        generation: u64,
+        format: &'static str,
+        result: std::result::Result<Box<dyn Any + Send>, String>,
+    },
+    /// 전용 보기가 요청한 워커 작업의 결과
+    CustomResult {
+        generation: u64,
+        payload: Box<dyn Any + Send>,
+    },
 }
 
 /// MD를 어떻게 열지 (FR-M06, FR-M09)
@@ -237,6 +258,8 @@ enum Content {
     Text(Box<TextView>),
     Pdf(Box<PdfView>),
     Md(Box<MdView>),
+    /// 레지스트리의 전용 보기 포맷 (이미지 등, §4.3 `OpenedDoc::Custom`)
+    Custom(Box<dyn CustomView>),
 }
 
 struct DocView {
@@ -254,6 +277,7 @@ struct PaintOutcome {
     cmds: Vec<Cmd>,
     md_cmds: Vec<MdCmd>,
     md_first_paint_ms: Option<f64>,
+    custom_cmds: Vec<CustomCmd>,
     generation: u64,
     status: Option<String>,
 }
@@ -443,6 +467,7 @@ fn hand_off_to_running(path: Option<&Path>) -> bool {
 
 pub fn run(opts: StartOptions) -> Result<()> {
     install_panic_hook();
+    formats::install();
     let config_path = config::default_path();
     let (cfg, cfg_err) = config_path.as_deref().map(Config::load).unwrap_or_default();
     if cfg.general.single_instance
@@ -690,9 +715,21 @@ fn guard_bool(hwnd: HWND, f: impl FnOnce() -> bool) -> bool {
 }
 
 fn is_md_path(p: &Path) -> bool {
-    p.extension()
-        .and_then(OsStr::to_str)
-        .is_some_and(|e| e.eq_ignore_ascii_case("md") || e.eq_ignore_ascii_case("markdown"))
+    leaf_core::format::registry()
+        .by_path(p)
+        .is_some_and(|f| f.id == leaf_fmt_markdown::FORMAT.id)
+}
+
+/// 파일 앞부분으로 포맷 판별 (워커에서 호출, 확장자를 모를 때)
+fn sniff_file(path: &Path) -> Option<&'static str> {
+    use std::io::Read;
+    let mut head = Vec::with_capacity(leaf_core::format::SNIFF_LEN);
+    std::fs::File::open(path)
+        .ok()?
+        .take(leaf_core::format::SNIFF_LEN as u64)
+        .read_to_end(&mut head)
+        .ok()?;
+    leaf_core::format::registry().sniff(&head).map(|f| f.id)
 }
 
 fn ctrl_down() -> bool {
@@ -2086,6 +2123,7 @@ impl App {
                 tv.is_mapped(),
             ),
             Content::Pdf(pv) => (pv.path.clone(), MdMode::Auto, false),
+            Content::Custom(cv) => (cv.path().to_path_buf(), MdMode::Auto, false),
             _ => return,
         };
         if mapped {
@@ -2104,6 +2142,7 @@ impl App {
             Content::Pdf(pv) => Some(pv.position()),
             Content::Text(tv) => Some(tv.position()),
             Content::Md(mv) => Some(mv.position()),
+            Content::Custom(cv) => Some(cv.position()),
             _ => None,
         }
     }
@@ -2113,6 +2152,7 @@ impl App {
             Content::Pdf(pv) => Some(pv.path.clone()),
             Content::Text(tv) => Some(tv.path.clone()),
             Content::Md(mv) => Some(mv.path.clone()),
+            Content::Custom(cv) => Some(cv.path().to_path_buf()),
             _ => None,
         }
     }
@@ -2161,6 +2201,12 @@ impl App {
                     mv.restore(&pos);
                     true
                 }
+                Content::Custom(cv)
+                    if same_path(cv.path(), &pos.path) && pos.view == cv.view_key() =>
+                {
+                    cv.restore(&pos);
+                    true
+                }
                 _ => false,
             }
         };
@@ -2189,6 +2235,7 @@ impl App {
             Content::Pdf(pv) => Some(pv.position()),
             Content::Text(tv) => Some(tv.position()),
             Content::Md(mv) => Some(mv.position()),
+            Content::Custom(cv) => Some(cv.position()),
             _ => None,
         };
         if let Some(pos) = pos {
@@ -2224,6 +2271,7 @@ impl App {
                 Content::Pdf(pv) => Some(pv.path.clone()),
                 Content::Text(tv) => Some(tv.path.clone()),
                 Content::Md(mv) => Some(mv.path.clone()),
+                Content::Custom(cv) => Some(cv.path().to_path_buf()),
                 _ => v
                     .loading
                     .as_ref()
@@ -2275,11 +2323,6 @@ impl App {
         self.remember_current();
         let generation = self.doc_gen.get() + 1;
         self.doc_gen.set(generation);
-        let ext = path
-            .extension()
-            .and_then(OsStr::to_str)
-            .map(str::to_ascii_lowercase)
-            .unwrap_or_default();
         self.view.borrow_mut().loading = Some((generation, path.clone(), Instant::now()));
         self.set_status(0, &format!("여는 중… {}", path.display()));
 
@@ -2293,9 +2336,33 @@ impl App {
                 std::fs::metadata(&path).is_ok_and(|m| m.len() > limit)
             }
         };
-        match ext.as_str() {
-            "pdf" => self.pdf.borrow_mut().open(generation, &path),
-            "md" | "markdown" if !md_raw => {
+        let Some(format) = leaf_core::format::registry().by_path(&path) else {
+            // 확장자로 모르면 앞부분을 읽어 판별한다 (워커, §4.3 sniff)
+            let waker = self.waker.clone();
+            self.workers.spawn(move || {
+                let format = sniff_file(&path);
+                waker.send(UiMsg::Sniffed {
+                    generation,
+                    path,
+                    format,
+                });
+            });
+            return;
+        };
+        self.start_open(generation, path, format, md_raw);
+    }
+
+    /// 판별한 포맷의 보기로 연다
+    fn start_open(
+        &self,
+        generation: u64,
+        path: PathBuf,
+        format: &'static leaf_doc::format::FormatInfo,
+        md_raw: bool,
+    ) {
+        match format.view {
+            ViewKind::Paged => self.pdf.borrow_mut().open(generation, &path),
+            ViewKind::Flow if !md_raw => {
                 let waker = self.waker.clone();
                 let root = self.model.borrow().nodes.first().map(|n| n.path.clone());
                 let started = Instant::now();
@@ -2308,7 +2375,7 @@ impl App {
                     });
                 });
             }
-            "txt" | "md" | "markdown" => {
+            ViewKind::Flow | ViewKind::Text => {
                 let waker = self.waker.clone();
                 let threshold = self.config.borrow().mmap_threshold();
                 self.workers.spawn(move || {
@@ -2330,12 +2397,104 @@ impl App {
                     waker.send(UiMsg::TextLoaded { generation, result });
                 });
             }
-            _ => {
-                self.set_content(Content::Message(format!(
-                    "지원하지 않는 형식입니다: {}",
-                    path.display()
-                )));
-                self.view.borrow_mut().loading = None;
+            ViewKind::Custom => {
+                let Some(cf) = formats::custom(format.id) else {
+                    self.open_failed(&path, "이 형식의 보기가 빌드에 포함되지 않았습니다");
+                    return;
+                };
+                let ctx = self.open_ctx();
+                let waker = self.waker.clone();
+                self.workers.spawn(move || {
+                    let result = guarded(|| cf.load(&path, &ctx));
+                    waker.send(UiMsg::CustomLoaded {
+                        generation,
+                        format: cf.info().id,
+                        result,
+                    });
+                });
+            }
+        }
+    }
+
+    fn open_ctx(&self) -> OpenCtx {
+        let v = self.view.borrow();
+        OpenCtx::from_config(
+            &self.config.borrow(),
+            view_size(&v.renderer, self.doc),
+            v.renderer.dpi(),
+        )
+    }
+
+    /// 열기 실패: 오류 화면 (FR-V07)
+    fn open_failed(&self, path: &Path, why: &str) {
+        self.view.borrow_mut().loading = None;
+        self.set_content(Content::Message(format!(
+            "파일을 열 수 없습니다.\n\n{}\n\n{why}",
+            path.display()
+        )));
+        self.view.borrow_mut().info.clear();
+        self.set_status(0, &path.display().to_string());
+    }
+
+    fn on_sniffed(&self, generation: u64, path: PathBuf, format: Option<&'static str>) {
+        if self.view.borrow().loading.as_ref().map(|l| l.0) != Some(generation) {
+            return;
+        }
+        match format.and_then(|id| leaf_core::format::registry().by_id(id)) {
+            Some(f) => self.start_open(generation, path, f, false),
+            None => self.open_failed(&path, "지원하지 않는 형식입니다"),
+        }
+    }
+
+    fn on_custom_loaded(
+        &self,
+        generation: u64,
+        format: &'static str,
+        result: std::result::Result<Box<dyn Any + Send>, String>,
+    ) {
+        let Some((path, _)) = self.take_loading(generation) else {
+            return;
+        };
+        let loaded = match result {
+            Ok(l) => l,
+            Err(e) => {
+                self.open_failed(&path, &e);
+                return;
+            }
+        };
+        let Some(cf) = formats::custom(format) else {
+            return;
+        };
+        let ctx = self.open_ctx();
+        let mut cv = cf.create(generation, path.clone(), loaded, &ctx);
+        if let Some(pos) = self.saved_pos(&path) {
+            cv.restore(&pos);
+        }
+        let info = cv.info();
+        self.hide_bar();
+        self.set_content(Content::Custom(cv));
+        perf::record("custom_open", format!("format={format} {info}"));
+        self.view.borrow_mut().info = info.clone();
+        self.set_status(0, &info);
+        self.doc_opened(path);
+    }
+
+    /// 전용 보기의 워커 작업을 돌린다. 결과는 같은 세대의 보기에만 전달된다
+    fn run_custom_cmds(&self, generation: u64, cmds: Vec<CustomCmd>) {
+        for c in cmds {
+            match c {
+                CustomCmd::Spawn(job) => {
+                    let waker = self.waker.clone();
+                    self.workers.spawn(move || {
+                        let payload = catch_unwind(AssertUnwindSafe(job)).unwrap_or_else(|p| {
+                            Box::new(format!("내부 오류: {}", panic_text(&*p)))
+                        });
+                        waker.send(UiMsg::CustomResult {
+                            generation,
+                            payload,
+                        });
+                    });
+                }
             }
         }
     }
@@ -2350,7 +2509,10 @@ impl App {
             (was_pdf && !is_pdf, old)
         };
         let leaving_md = matches!(old, Content::Md(_));
-        let leaving_doc = matches!(old, Content::Pdf(_) | Content::Text(_) | Content::Md(_));
+        let leaving_doc = matches!(
+            old,
+            Content::Pdf(_) | Content::Text(_) | Content::Md(_) | Content::Custom(_)
+        );
         if let Content::Text(tv) = &old {
             tv.cancel_all();
         }
@@ -2428,6 +2590,31 @@ impl App {
                 }
                 UiMsg::Pdf(ev) => self.on_pdf_event(ev),
                 UiMsg::Watch(ev) => self.on_watch(ev),
+                UiMsg::Sniffed {
+                    generation,
+                    path,
+                    format,
+                } => self.on_sniffed(generation, path, format),
+                UiMsg::CustomLoaded {
+                    generation,
+                    format,
+                    result,
+                } => self.on_custom_loaded(generation, format, result),
+                UiMsg::CustomResult {
+                    generation,
+                    payload,
+                } => {
+                    let mut v = self.view.borrow_mut();
+                    let dv = &mut *v;
+                    if let Content::Custom(cv) = &mut dv.content
+                        && cv.generation() == generation
+                        && let Ok(t) = dv.renderer.target(self.doc)
+                    {
+                        cv.on_result(t, payload);
+                    }
+                    drop(v);
+                    self.invalidate_doc();
+                }
                 UiMsg::MdLoaded {
                     generation,
                     result,
@@ -2844,6 +3031,7 @@ impl App {
         }
         self.run_cmds(outcome.generation, outcome.cmds);
         self.run_md_cmds(outcome.generation, outcome.md_cmds);
+        self.run_custom_cmds(outcome.generation, outcome.custom_cmds);
         self.sync_outline_current();
         if let Some(s) = outcome.status {
             self.set_status(1, &s);
@@ -2892,6 +3080,13 @@ impl App {
             }
             Content::Text(tv) => Some(tv.scroll_metrics()),
             Content::Md(mv) => Some(mv.scroll_metrics()),
+            Content::Custom(cv) => {
+                let ((a, b, c), (d, e, f)) = cv.scroll_metrics();
+                Some((
+                    (a as f64, b as f64, c as f64),
+                    (d as f64, e as f64, f as f64),
+                ))
+            }
             _ => None,
         }
     }
@@ -3023,12 +3218,15 @@ impl App {
             SB_BOTTOM => f32::MAX as f64,
             _ => return,
         } as f32;
-        if let Content::Pdf(pv) = &mut self.view.borrow_mut().content {
-            if bar == SB_VERT {
-                pv.scroll_to(None, Some(new));
-            } else {
-                pv.scroll_to(Some(new), None);
-            }
+        let (x, y) = if bar == SB_VERT {
+            (None, Some(new))
+        } else {
+            (Some(new), None)
+        };
+        match &mut self.view.borrow_mut().content {
+            Content::Pdf(pv) => pv.scroll_to(x, y),
+            Content::Custom(cv) => cv.scroll_to(x, y),
+            _ => {}
         }
         self.invalidate_doc();
     }
@@ -3060,6 +3258,9 @@ impl App {
                 }
                 Content::Text(tv) => tv.zoom_by(1.1f32.powf(steps)),
                 Content::Md(mv) => mv.zoom_by(1.1f32.powf(steps)),
+                Content::Custom(cv) => {
+                    cv.zoom_by(1.1f32.powf(steps), Some((pt.x as f32 * k, pt.y as f32 * k)))
+                }
                 _ => {}
             }
             self.invalidate_doc();
@@ -3081,6 +3282,8 @@ impl App {
                 Content::Text(tv) => tv.scroll_px(d),
                 Content::Md(_) if horizontal => return,
                 Content::Md(mv) => mv.scroll_by(d),
+                Content::Custom(cv) if horizontal => cv.scroll_by(d, 0.0),
+                Content::Custom(cv) => cv.scroll_by(0.0, d),
                 _ => return,
             }
         }
@@ -3144,6 +3347,11 @@ impl App {
                         }
                     }
                 },
+                Content::Custom(cv) => {
+                    if !cv.on_key(vk.0, ctrl, shift_down()) {
+                        return;
+                    }
+                }
                 _ => return,
             }
         }
@@ -3209,6 +3417,21 @@ impl App {
                     }
                     _ => return,
                 },
+                Content::Custom(cv) => match msg {
+                    WM_LBUTTONDOWN => cv.on_mouse_down(x, y),
+                    WM_MOUSEMOVE => {
+                        let dragging = wparam.0 & 0x0001 != 0;
+                        let c = cv.on_mouse_move(x, y, dragging);
+                        self.cursor.set(c);
+                        if !dragging {
+                            drop(v);
+                            self.apply_cursor();
+                            return;
+                        }
+                    }
+                    WM_LBUTTONUP => cv.on_mouse_up(),
+                    _ => return,
+                },
                 _ => return,
             }
         }
@@ -3239,6 +3462,7 @@ impl App {
             Content::Pdf(pv) => pv.first_page_shown(),
             Content::Text(tv) => tv.first_paint_ms.is_some(),
             Content::Md(mv) => mv.first_paint_ms.is_some(),
+            Content::Custom(cv) => cv.first_paint_done(),
             _ => false,
         };
         let mut b = self.bench.borrow_mut();
@@ -3269,6 +3493,10 @@ impl App {
                     mv.scroll_by(BENCH_STEP);
                     mv.at_end()
                 }
+                Content::Custom(cv) => {
+                    cv.scroll_by(0.0, BENCH_STEP);
+                    cv.at_end()
+                }
                 _ => true,
             }
         };
@@ -3291,6 +3519,10 @@ impl App {
         let (tiles, render_total, bitmap_bytes) = match &self.view.borrow().content {
             Content::Pdf(pv) => pv.tile_stats(),
             Content::Md(mv) => (mv.image_count() as u32, 0.0, mv.bitmap_bytes()),
+            Content::Custom(cv) => {
+                let (n, bytes) = cv.bitmap_stats();
+                (n, 0.0, bytes)
+            }
             _ => (0, 0.0, 0),
         };
         let Some(mut b) = self.bench.borrow_mut().take() else {
@@ -3351,7 +3583,8 @@ const WELCOME_BODY: &str = "폴더를 열려면 Ctrl+O를 누르거나 탐색기
 공통: Ctrl+F 찾기 (Enter/F3 다음, Shift+Enter/Shift+F3 이전) · 끌어서 선택 후 Ctrl+C 복사 · Ctrl+A 전체 선택 · Ctrl+휠, Ctrl +/- 확대\n\
 PDF: 휠·PgUp/PgDn·Space로 넘기기 · Ctrl+0 폭 맞춤 · Ctrl+1 실제 크기 · Ctrl+2 쪽 맞춤 · Ctrl+G 쪽 이동 · 사이드바 \"목차\" 탭\n\
 TXT: Alt+Z 자동 줄바꿈 켜기/끄기 · Ctrl+G 줄 이동 · Ctrl+0 기본 배율 · Ctrl+Home/End 처음/끝\n\
-MD: 링크 클릭으로 이동 · Ctrl+U 원문 보기 · 사이드바 \"목차\" 탭";
+MD: 링크 클릭으로 이동 · Ctrl+U 원문 보기 · 사이드바 \"목차\" 탭\n\
+이미지: Ctrl+0 창에 맞춤 · Ctrl+1 실제 크기 · 끌어서 이동";
 
 fn paint(v: &mut DocView, hwnd: HWND) -> Result<PaintOutcome> {
     let mut out = PaintOutcome::default();
@@ -3433,6 +3666,13 @@ fn paint(v: &mut DocView, hwnd: HWND) -> Result<PaintOutcome> {
                 }
                 out.generation = mv.generation;
                 out.status = Some(mv.status());
+            }
+            Content::Custom(cv) => {
+                t.rt.Clear(Some(&rgb(t.pal.bg)));
+                cv.set_view(vw, vh, dpi);
+                out.custom_cmds = cv.paint(t);
+                out.generation = cv.generation();
+                out.status = Some(cv.status());
             }
         }
     }
@@ -3745,6 +3985,7 @@ extern "system" fn doc_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                         Content::Pdf(pv) => pv.release_bitmaps(),
                         Content::Text(tv) => tv.release(),
                         Content::Md(mv) => mv.release(),
+                        Content::Custom(cv) => cv.release(),
                         _ => {}
                     }
                 } else {

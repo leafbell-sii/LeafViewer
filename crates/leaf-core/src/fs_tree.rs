@@ -69,8 +69,38 @@ fn is_hidden(_meta: &std::fs::Metadata) -> bool {
 mod tests {
     use super::*;
 
+    /// 트리 필터는 설치된 레지스트리를 따른다 — 테스트용으로 PDF·MD·TXT만 넣는다
+    fn install_test_registry() {
+        use leaf_doc::format::{FormatInfo, ViewKind, no_sniff};
+        static F: [FormatInfo; 3] = [
+            FormatInfo {
+                id: "pdf",
+                name: "PDF",
+                extensions: &["pdf"],
+                view: ViewKind::Paged,
+                sniff: no_sniff,
+            },
+            FormatInfo {
+                id: "markdown",
+                name: "MD",
+                extensions: &["md", "markdown"],
+                view: ViewKind::Flow,
+                sniff: no_sniff,
+            },
+            FormatInfo {
+                id: "text",
+                name: "텍스트",
+                extensions: &["txt"],
+                view: ViewKind::Text,
+                sniff: no_sniff,
+            },
+        ];
+        crate::format::install(crate::format::Registry::new(F.iter().collect()));
+    }
+
     #[test]
     fn dirs_first_filtered_and_sorted() {
+        install_test_registry();
         let root = std::env::temp_dir().join(format!("leaf-core-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("b_dir")).unwrap();

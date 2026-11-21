@@ -2,3 +2,4 @@
 *.dll
 /perf/results/
 /testdata/out/
+/dist/

@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 
 pub mod flow;
+pub mod format;
 pub mod geom;
 pub mod paged;
 pub mod text;

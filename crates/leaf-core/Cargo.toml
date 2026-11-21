@@ -1,12 +1,13 @@
 [package]
 name = "leaf-core"
-description = "UI 비의존 코어: 트리 모델, 정렬, 작업 스케줄러"
+description = "UI 비의존 코어: 트리 모델, 포맷 레지스트리, 정렬, 작업 스케줄러, 설정"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
 [dependencies]
+leaf-doc.workspace = true
 crossbeam-channel.workspace = true
 notify = { version = "9.0.0", default-features = false }
 serde.workspace = true

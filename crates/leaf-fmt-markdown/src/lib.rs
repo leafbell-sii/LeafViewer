@@ -14,6 +14,15 @@ use pulldown_cmark::{
 /// 이 크기를 넘는 MD는 TXT 보기로 열고 렌더링은 사용자가 고른다 (FR-M06, 설정 `[markdown] render_size_limit_mb`).
 pub const RENDER_SIZE_LIMIT: u64 = 8 << 20;
 
+/// 포맷 레지스트리 등록 정보 (SPEC §4.3)
+pub static FORMAT: leaf_doc::format::FormatInfo = leaf_doc::format::FormatInfo {
+    id: "markdown",
+    name: "MD",
+    extensions: &["md", "markdown"],
+    view: leaf_doc::format::ViewKind::Flow,
+    sniff: leaf_doc::format::no_sniff,
+};
+
 /// 파일 바이트 → 문자열. BOM·UTF-8 검사·`chardetng` 순으로 인코딩을 감지한다 (TXT와 같은 규칙).
 /// 돌려주는 두 번째 값은 상태 표시줄용 인코딩 이름.
 pub fn decode(bytes: &[u8], ansi_cp: u32) -> (String, &'static str) {
