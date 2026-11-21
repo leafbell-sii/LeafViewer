@@ -3,3 +3,4 @@
 /perf/results/
 /testdata/out/
 /dist/
+__pycache__/
