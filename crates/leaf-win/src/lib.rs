@@ -3,6 +3,8 @@
 
 mod app;
 mod bar;
+mod mdload;
+mod mdview;
 mod pdfview;
 mod render;
 mod textload;

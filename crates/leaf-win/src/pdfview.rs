@@ -342,10 +342,14 @@ impl PdfView {
                 ZoomMode::Custom(z) => format!("{z:.4}"),
             },
             offset: 0,
+            view: "pdf".into(),
         }
     }
 
     pub fn restore(&mut self, pos: &FilePos) {
+        if !(pos.view.is_empty() || pos.view == "pdf") {
+            return;
+        }
         let mode = match pos.zoom.as_str() {
             "fit-page" => ZoomMode::FitPage,
             "fit-width" | "" => ZoomMode::FitWidth,
