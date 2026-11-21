@@ -5,6 +5,8 @@ members = [
     "crates/leaf-core",
     "crates/leaf-fmt-pdf",
     "crates/leaf-fmt-text",
+    "crates/leaf-fmt-markdown",
+    "crates/leaf-layout",
     "crates/leaf-win",
     "crates/leaf-app",
 ]
@@ -20,6 +22,8 @@ leaf-doc = { path = "crates/leaf-doc" }
 leaf-core = { path = "crates/leaf-core" }
 leaf-fmt-pdf = { path = "crates/leaf-fmt-pdf" }
 leaf-fmt-text = { path = "crates/leaf-fmt-text" }
+leaf-fmt-markdown = { path = "crates/leaf-fmt-markdown" }
+leaf-layout = { path = "crates/leaf-layout" }
 leaf-win = { path = "crates/leaf-win" }
 crossbeam-channel = "0.5.17"
 pdfium-render = { version = "0.9.5", default-features = false, features = ["pdfium_latest", "thread_safe"] }

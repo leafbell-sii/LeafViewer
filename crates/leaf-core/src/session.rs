@@ -39,6 +39,9 @@ pub struct FilePos {
     pub zoom: String,
     /// TXT: 화면 맨 위 행의 파일 바이트 오프셋 (이때 `y_pt`는 그 행 안의 DIP)
     pub offset: u64,
+    /// 이 위치를 기록한 보기: "pdf" | "txt" | "md". MD는 원문(TXT) 보기로도 열 수 있어
+    /// 다른 보기의 위치를 잘못 해석하지 않도록 구분한다 (빈 값 = 이전 버전 세션).
+    pub view: String,
 }
 
 pub fn default_path() -> Option<PathBuf> {
@@ -109,6 +112,7 @@ mod tests {
                 y_pt: 1.5,
                 zoom: "fit-width".into(),
                 offset: i as u64,
+                view: "pdf".into(),
             });
         }
         s.remember(FilePos {

@@ -472,10 +472,14 @@ impl TextView {
             y_pt: self.y_off,
             zoom: format!("{:.4}", self.zoom),
             offset: self.anchor as u64,
+            view: "txt".into(),
         }
     }
 
     pub fn restore(&mut self, pos: &FilePos) {
+        if !(pos.view.is_empty() || pos.view == "txt") {
+            return;
+        }
         if let Ok(z) = pos.zoom.parse::<f32>() {
             self.zoom = z.clamp(ZOOM_MIN, ZOOM_MAX);
         }
@@ -881,7 +885,7 @@ impl TextView {
 }
 
 /// 텍스트 범위의 줄 단위 사각형 (DIP)
-fn range_rects(
+pub(crate) fn range_rects(
     layout: &IDWriteTextLayout,
     start: u32,
     len: u32,

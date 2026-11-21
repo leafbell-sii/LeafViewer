@@ -28,6 +28,9 @@ pub const COLOR_TEXT: u32 = 0x1F1F1F;
 pub const COLOR_DIM: u32 = 0x6B6B6B;
 pub const COLOR_PDF_BG: u32 = 0xE6E6E6;
 pub const COLOR_PLACEHOLDER: u32 = 0xF7F7F7;
+pub const COLOR_LINK: u32 = 0x0969DA;
+pub const COLOR_CODE_BG: u32 = 0xF6F8FA;
+pub const COLOR_BORDER: u32 = 0xD0D7DE;
 
 /// GPU 렌더 타깃 사용 여부. 설정 파일(§8)이 생기면 `[general] gpu`로 대체한다.
 fn use_gpu() -> bool {
@@ -44,6 +47,11 @@ pub struct Target {
     pub hit: ID2D1SolidColorBrush,
     pub hit_current: ID2D1SolidColorBrush,
     pub selection: ID2D1SolidColorBrush,
+    /// MD: 링크 글자, 코드 블록·표 머리글 배경, 구분선·테두리, 인라인 코드 배경
+    pub link: ID2D1SolidColorBrush,
+    pub code_bg: ID2D1SolidColorBrush,
+    pub border: ID2D1SolidColorBrush,
+    pub inline_code: ID2D1SolidColorBrush,
     /// 타깃이 다시 만들어질 때마다 증가 → 이 타깃에서 만든 비트맵이 아직 유효한지 판별
     pub epoch: u64,
 }
@@ -161,6 +169,10 @@ impl Renderer {
                 let hit = rt.CreateSolidColorBrush(&rgba(0xFFD400, 0.40), None)?;
                 let hit_current = rt.CreateSolidColorBrush(&rgba(0xFF7A00, 0.55), None)?;
                 let selection = rt.CreateSolidColorBrush(&rgba(0x2F7BFF, 0.30), None)?;
+                let link = rt.CreateSolidColorBrush(&rgb(COLOR_LINK), None)?;
+                let code_bg = rt.CreateSolidColorBrush(&rgb(COLOR_CODE_BG), None)?;
+                let border = rt.CreateSolidColorBrush(&rgb(COLOR_BORDER), None)?;
+                let inline_code = rt.CreateSolidColorBrush(&rgba(0x818B98, 0.18), None)?;
                 self.epoch += 1;
                 self.target = Some(Target {
                     rt,
@@ -171,6 +183,10 @@ impl Renderer {
                     hit,
                     hit_current,
                     selection,
+                    link,
+                    code_bg,
+                    border,
+                    inline_code,
                     epoch: self.epoch,
                 });
             }
@@ -240,10 +256,26 @@ pub fn rect(l: f32, t: f32, r: f32, b: f32) -> D2D_RECT_F {
 /// PDFium BGRA(불투명) 버퍼 → D2D 비트맵. 비트맵 DPI를 96으로 두면 1px = 1DIP 이므로
 /// 그릴 때는 목적지 사각형(DIP)을 직접 지정한다.
 pub fn create_bitmap(t: &Target, w: u32, h: u32, stride: u32, bgra: &[u8]) -> Result<ID2D1Bitmap> {
+    create_bitmap_with(t, w, h, stride, bgra, D2D1_ALPHA_MODE_IGNORE)
+}
+
+/// 투명도가 있는 이미지(WIC 32bppPBGRA, 미리 곱한 알파) → D2D 비트맵 (MD 이미지)
+pub fn create_bitmap_premul(t: &Target, w: u32, h: u32, bgra: &[u8]) -> Result<ID2D1Bitmap> {
+    create_bitmap_with(t, w, h, w * 4, bgra, D2D1_ALPHA_MODE_PREMULTIPLIED)
+}
+
+fn create_bitmap_with(
+    t: &Target,
+    w: u32,
+    h: u32,
+    stride: u32,
+    bgra: &[u8],
+    alpha: D2D1_ALPHA_MODE,
+) -> Result<ID2D1Bitmap> {
     let props = D2D1_BITMAP_PROPERTIES {
         pixelFormat: D2D1_PIXEL_FORMAT {
             format: DXGI_FORMAT_B8G8R8A8_UNORM,
-            alphaMode: D2D1_ALPHA_MODE_IGNORE,
+            alphaMode: alpha,
         },
         dpiX: 96.0,
         dpiY: 96.0,

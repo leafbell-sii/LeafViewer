@@ -1,6 +1,7 @@
-//! 문서 모델 공통 타입 (SPEC §4.1 `leaf-doc`). UI·Win32 비의존.
+//! 문서 모델 공통 타입 (SPEC §4.1 `leaf-doc`): 고정 페이지, Flow IR, 목차·링크. UI·Win32 비의존.
 #![forbid(unsafe_code)]
 
+pub mod flow;
 pub mod geom;
 pub mod paged;
 pub mod text;
