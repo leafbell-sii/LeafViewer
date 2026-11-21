@@ -7,6 +7,7 @@
 
   -Actions 항목 (순서대로 실행):
     key:F3            포커스된 컨트롤에 WM_KEYDOWN (가상 키 이름: F3, RETURN, NEXT, DOWN, ESCAPE …)
+    syskey:Z          Alt+키 (WM_SYSKEYDOWN, 예: Alt+Z 자동 줄바꿈)
     text:문자열        포커스된 컨트롤(EDIT)에 WM_SETTEXT
     click:x,y         창 왼쪽 위 기준 물리 픽셀 위치의 자식 컨트롤에 왼쪽 클릭
     drag:x1,y1,x2,y2  끌기
@@ -70,11 +71,12 @@ function Get-ChildAt([int]$x, [int]$y) {
         $cur = $child
     }
 }
-$vk = @{ F3 = 0x72; RETURN = 0x0D; ESCAPE = 0x1B; NEXT = 0x22; PRIOR = 0x21; DOWN = 0x28; UP = 0x26; HOME = 0x24; END = 0x23; SPACE = 0x20 }
+$vk = @{ F3 = 0x72; RETURN = 0x0D; ESCAPE = 0x1B; NEXT = 0x22; PRIOR = 0x21; DOWN = 0x28; UP = 0x26; HOME = 0x24; END = 0x23; SPACE = 0x20; Z = 0x5A }
 foreach ($a in $Actions) {
     $kind, $arg = $a -split ':', 2
     switch ($kind) {
         'key'   { $f = Get-Focus; [W]::PostMessageW($f, 0x100, [IntPtr]$vk[$arg], [IntPtr]1) | Out-Null; [W]::PostMessageW($f, 0x101, [IntPtr]$vk[$arg], [IntPtr]0xC0000001) | Out-Null }
+        'syskey' { $f = Get-Focus; [W]::PostMessageW($f, 0x104, [IntPtr]$vk[$arg], [IntPtr]0x20000001) | Out-Null; [W]::PostMessageW($f, 0x105, [IntPtr]$vk[$arg], [IntPtr]0xE0000001) | Out-Null }
         'text'  { $f = Get-Focus; [W]::SendMessageW($f, 0x000C, [IntPtr]::Zero, $arg) | Out-Null }
         'click' { $x, $y = $arg -split ','; $t = Get-ChildAt $x $y; $l = [W]::MakeL($t[1].X, $t[1].Y)
                   [W]::PostMessageW($t[0], 0x201, [IntPtr]1, $l) | Out-Null; [W]::PostMessageW($t[0], 0x202, [IntPtr]0, $l) | Out-Null }

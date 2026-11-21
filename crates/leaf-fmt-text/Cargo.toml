@@ -1,0 +1,12 @@
+[package]
+name = "leaf-fmt-text"
+description = "TXT 포맷 — 인코딩 감지, 희소 줄 인덱스, 행(row) 탐색·디코딩·찾기"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+chardetng = "1.0.0"
+encoding_rs = "0.8.44"
+memchr = "2.8.3"

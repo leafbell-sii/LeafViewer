@@ -52,7 +52,6 @@ pub struct Renderer {
     d2d: ID2D1Factory1,
     pub dwrite: IDWriteFactory,
     pub body: IDWriteTextFormat,
-    pub mono: IDWriteTextFormat,
     pub title: IDWriteTextFormat,
     target: Option<Target>,
     epoch: u64,
@@ -84,13 +83,11 @@ impl Renderer {
             let d2d: ID2D1Factory1 = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
             let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
             let body = text_format(&dwrite, w!("Segoe UI"), 11.0, DWRITE_FONT_WEIGHT_NORMAL)?;
-            let mono = text_format(&dwrite, w!("Consolas"), 11.0, DWRITE_FONT_WEIGHT_NORMAL)?;
             let title = text_format(&dwrite, w!("Segoe UI"), 20.0, DWRITE_FONT_WEIGHT_SEMI_BOLD)?;
             Ok(Self {
                 d2d,
                 dwrite,
                 body,
-                mono,
                 title,
                 target: None,
                 epoch: 0,
