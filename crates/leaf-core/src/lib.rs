@@ -2,8 +2,10 @@
 #![forbid(unsafe_code)]
 
 pub mod fs_tree;
+pub mod lru;
 pub mod natural;
 pub mod perf;
+pub mod session;
 pub mod worker;
 
 /// v1 기본 지원 확장자. M1 이후 포맷 레지스트리(§4.3)로 대체된다.
