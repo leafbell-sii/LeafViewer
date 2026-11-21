@@ -18,6 +18,20 @@ pub use leaf_doc::paged::{TileKey, TileSpec};
 use leaf_doc::text::PageText;
 use leaf_doc::{Link, OutlineItem, RectF};
 
+/// 포맷 레지스트리 등록 정보 (SPEC §4.3). 확장자가 없어도 `%PDF-` 서명으로 알아본다.
+pub static FORMAT: leaf_doc::format::FormatInfo = leaf_doc::format::FormatInfo {
+    id: "pdf",
+    name: "PDF",
+    extensions: &["pdf"],
+    view: leaf_doc::format::ViewKind::Paged,
+    sniff: sniff_pdf,
+};
+
+/// PDF 사양은 서명이 처음 1024바이트 안에 있으면 된다고 허용한다.
+fn sniff_pdf(head: &[u8]) -> bool {
+    head.windows(5).take(1024).any(|w| w == b"%PDF-")
+}
+
 /// 요청 세대 번호 (SPEC §4.2). 문서를 바꿀 때마다 증가시키고, 다른 세대의 결과는 버린다.
 pub type Generation = u64;
 

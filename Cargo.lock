@@ -292,16 +292,17 @@ dependencies = [
 
 [[package]]
 name = "leaf-app"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "leaf-win",
 ]
 
 [[package]]
 name = "leaf-core"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "crossbeam-channel",
+ "leaf-doc",
  "notify",
  "serde",
  "toml",
@@ -309,11 +310,18 @@ dependencies = [
 
 [[package]]
 name = "leaf-doc"
-version = "0.0.1"
+version = "1.0.0"
+
+[[package]]
+name = "leaf-fmt-image"
+version = "1.0.0"
+dependencies = [
+ "leaf-doc",
+]
 
 [[package]]
 name = "leaf-fmt-markdown"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "encoding_rs",
  "leaf-doc",
@@ -323,7 +331,7 @@ dependencies = [
 
 [[package]]
 name = "leaf-fmt-pdf"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "crossbeam-channel",
  "leaf-doc",
@@ -332,27 +340,29 @@ dependencies = [
 
 [[package]]
 name = "leaf-fmt-text"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "chardetng",
  "encoding_rs",
+ "leaf-doc",
  "memchr",
 ]
 
 [[package]]
 name = "leaf-layout"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "leaf-doc",
 ]
 
 [[package]]
 name = "leaf-win"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "crossbeam-channel",
  "leaf-core",
  "leaf-doc",
+ "leaf-fmt-image",
  "leaf-fmt-markdown",
  "leaf-fmt-pdf",
  "leaf-fmt-text",

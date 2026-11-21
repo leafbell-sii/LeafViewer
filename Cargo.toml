@@ -6,13 +6,14 @@ members = [
     "crates/leaf-fmt-pdf",
     "crates/leaf-fmt-text",
     "crates/leaf-fmt-markdown",
+    "crates/leaf-fmt-image",
     "crates/leaf-layout",
     "crates/leaf-win",
     "crates/leaf-app",
 ]
 
 [workspace.package]
-version = "0.0.1"
+version = "1.0.0"
 edition = "2024"
 license = "MIT"
 publish = false
@@ -23,6 +24,7 @@ leaf-core = { path = "crates/leaf-core" }
 leaf-fmt-pdf = { path = "crates/leaf-fmt-pdf" }
 leaf-fmt-text = { path = "crates/leaf-fmt-text" }
 leaf-fmt-markdown = { path = "crates/leaf-fmt-markdown" }
+leaf-fmt-image = { path = "crates/leaf-fmt-image" }
 leaf-layout = { path = "crates/leaf-layout" }
 leaf-win = { path = "crates/leaf-win" }
 crossbeam-channel = "0.5.17"

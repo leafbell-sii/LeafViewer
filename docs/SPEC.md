@@ -1,6 +1,6 @@
 # LeafViewer 명세서
 
-> 상태: **초안 v0.10** · 최종 수정 2026-11-21 · 기술 스택 **확정**(Win32 + Direct2D/DirectWrite) · **M0–M4 완료**(실측 §6.1.1–§6.1.5)
+> 상태: **v1.0** · 최종 수정 2026-11-21 · 기술 스택 **확정**(Win32 + Direct2D/DirectWrite) · **M0–M5 완료**(실측 §6.1.1–§6.1.6)
 > 대화를 통해 계속 갱신한다. 결정이 필요한 항목은 [§12 미결 사항](#12-미결-사항)에 모아 둔다.
 > 요구사항 우선순위: **P0** = v1 필수 · **P1** = v1 희망 · **P2** = 후속 버전
 
@@ -146,11 +146,13 @@ LeafViewer/                    (Cargo workspace)
 │  ├─ leaf-fmt-text/           # .txt — 인코딩 감지, 희소 줄 인덱스, mmap
 │  ├─ leaf-fmt-markdown/       # .md  — pulldown-cmark → Flow IR
 │  ├─ leaf-fmt-pdf/            # .pdf — PDFium 래퍼(전용 스레드)
+│  ├─ leaf-fmt-image/          # 이미지 — 형식 판별, EXIF 방향, 확대·스크롤 배치 (디코딩은 leaf-win의 WIC)
 │  ├─ leaf-layout/             # Flow IR → 블록 레이아웃 (텍스트 측정은 trait로 추상화)
 │  ├─ leaf-win/                # Win32 창·컨트롤, D2D/DWrite/WIC 렌더러 — unsafe는 여기만
 │  └─ leaf-app/                # main, 조립, 명령·단축키
 ├─ testdata/
 ├─ perf/
+├─ tools/                      # package.ps1 — 포터블 zip (§9)
 └─ docs/
 ```
 
@@ -200,6 +202,13 @@ pub enum OpenedDoc {
 ```
 
 뷰어는 `Text` / `Flow` / `Paged` 세 종류만 구현한다. 새 포맷은 셋 중 하나의 모델로 변환되면 뷰어 코드를 건드리지 않는다.
+
+M5 구현 메모 (위 설계를 두 층으로 나눴다):
+
+- **기술자** `leaf_doc::format::FormatInfo { id, name, extensions, view: ViewKind, sniff }` — Win32 비의존. 포맷 크레이트마다 `pub static FORMAT` 하나. `ViewKind` = `Text` · `Flow` · `Paged` · `Custom`.
+- **레지스트리** `leaf_core::format::Registry` — 앱 시작 때 `leaf-win/src/formats.rs`가 기술자를 모아 설치한다(컴파일 타임, feature flag). 트리 필터(FR-F03)·MD 링크 판정·문서 열기 분기·외부 편집기 후보가 모두 여기서 확장자를 묻는다. 확장자로 모르는 파일(명령줄·끌어다 놓기)은 워커가 앞 1KB를 읽어 `sniff`로 판별한다.
+- **`Custom` 보기** `leaf-win/src/custom.rs`의 `CustomFormat`(워커에서 `load`, UI에서 `create`)·`CustomView`(그리기·스크롤·확대·키·마우스·위치 저장/복원·비트맵 해제·워커 작업 요청). 앱은 이 trait로 스크롤바·휠·키·세션·뒤로/앞으로·파일 감시 새로고침·최소화 해제·벤치마크를 처리한다. TXT·MD·PDF 보기는 기존 코드 그대로다(`Content::Text/Md/Pdf`).
+- **확장성 검증(M5):** 이미지 포맷은 `leaf-fmt-image`(기술자·순수 로직) + `leaf-win/src/imageview.rs`(`CustomFormat` 구현) + `formats.rs` 한 줄 + Cargo feature `fmt-image`로 들어왔다. `Custom` 공통 경로를 만든 뒤로는 다음 전용 보기 포맷도 `app.rs`를 고치지 않는다. 기존 보기 모델로 바뀌는 포맷(예: `.log`를 TXT로)은 기술자의 확장자 목록만 고치면 된다. `--no-default-features`로 이미지 없이도 빌드된다.
 
 ### 4.4 Flow IR과 레이아웃
 
@@ -357,6 +366,18 @@ M3 구현 메모:
 | FR-A08 | 파일 연결: 포터블 배포이므로 앱이 등록하지 않는다. 사용자가 Windows "연결 프로그램"에서 exe를 직접 지정하면 동작(FR-A01 명령줄 처리로 충분) | P2 |
 | FR-A09 | 전체 화면 / 집중 모드 (F11) | P2 |
 
+### 5.7 이미지 (FR-I, M5)
+
+| ID | 요구사항 | 우선 | 상태 |
+|---|---|---|---|
+| FR-I01 | PNG·JPEG·GIF·BMP·WebP·TIFF·ICO를 WIC(OS 코덱)로 연다. 확장자가 없어도 서명으로 판별 | P0 | ✅ |
+| FR-I02 | 기본은 창에 맞춤(큰 그림만 줄이고 작은 그림은 실제 크기로 가운데). Ctrl+0 맞춤 · Ctrl+1 실제 픽셀 · Ctrl+휠(커서 기준)·Ctrl +/- 확대 5%–3200% | P0 | ✅ |
+| FR-I03 | 화면에 필요한 크기로만 디코딩(원본 해상도로 보관하지 않음). 고배율에서 그 배율의 전체가 예산을 넘으면 화면 근처 영역만 디코딩. 실제 픽셀보다 크게 볼 땐 2배부터 픽셀을 그대로 확대 | P0 | ✅ |
+| FR-I04 | EXIF 방향(사진 회전) 적용 | P0 | ✅ |
+| FR-I05 | 휠·화살표·PgUp/PgDn·Space·Home/End 스크롤, 끌어서 이동. 파일별 배율·위치 기억, 뒤로/앞으로, 파일이 바뀌면 다시 읽기 | P0 | ✅ |
+| FR-I06 | GIF 애니메이션 재생 | P2 | 첫 프레임만 |
+| FR-I07 | 이미지 복사(Ctrl+C), 투명 배경 체크무늬, ICC 색 프로필, SVG(U-14), HEIC·AVIF(확장 코덱) | P2 | — |
+
 ---
 
 ## 6. 비기능 요구사항
@@ -466,6 +487,23 @@ release 빌드, 각 3–5회 실행의 대표값. 측정 스크립트 `perf/meas
 - 화면 확인(`perf/capture.ps1`): 다크·라이트 테마(실행 중 설정 파일 변경 반영 포함, 제목 표시줄·스크롤바·사이드바·상태 표시줄), 파일 트리·목차 탭, MD 링크 이동 → Alt+← 뒤로(트리 선택 동기화), 열린 TXT가 바뀌면 자동 새로고침, 새 파일이 트리에 나타남, 단일 인스턴스(두 번째 실행이 기존 창에서 파일을 연다).
 - Ctrl 조합(Ctrl+B·Ctrl+Shift+E·Ctrl+,)과 사이드바 끌기·우클릭 메뉴는 메시지 주입으로 확인할 수 없어 수동으로 확인했다.
 
+#### 6.1.6 M5 실측 (2026-11-21, v1.0 — 이미지 포맷·포터블 배포)
+
+같은 기준 PC, release, 소프트웨어 D2D, `perf/measure.ps1`(모두 `--new-instance`). 이미지 열기 시간은 상태 표시줄의 "열기 Nms"(워커에서 디코더 열기 + 맞춤 크기 디코딩).
+
+| ID | 항목 | 목표 | 결과 | 판정 |
+|---|---|---|---|---|
+| NFR-P01 | 실행 → 첫 화면 (빈 세션) | ≤ 150ms | 86–99ms (첫 실행 235ms) | ✅ |
+| NFR-P02 | 유휴 메모리(빈 창) — 개인 작업 집합 / Private Bytes | ≤ 25MB | 11.4 / 12.6MB | ✅ |
+| 참고 | 6000×4000 PNG 열기(맞춤 18%) | — | 열기 101ms · Private Bytes 17MB(원본 전체면 96MB) | 참고 |
+| 참고 | 같은 그림 실제 크기 이상으로 확대·스크롤 | — | Private Bytes 32MB · 최대 작업 집합 74–82MB(영역 디코딩) | 참고 |
+| 참고 | 작은 JPEG(EXIF 방향 6) · 확장자 없는 PNG(sniff) | — | 열기 28ms · Private Bytes 12–14MB | 참고 |
+| NFR-P10 | 배포 크기 | exe ≤ 8MB | exe 3.10MB + `pdfium.dll` 7.48MB → zip 4.98MB | ✅ |
+
+- 디코딩 정확성은 `leaf-win` 단위 테스트가 실제 파일(`testdata/gen_img.py`)로 픽셀을 비교한다: EXIF 방향 6 회전, 원본 해상도 영역 디코딩의 격자 색, 축소 크기, GIF 프레임 수, 이미지가 아닌 파일의 오류. 방향 8종·영역 좌표 변환은 `leaf-fmt-image` 단위 테스트.
+- 포터블 zip을 다른 폴더에 풀어 PDF(exe 옆 `pdfium.dll` 바인딩)·이미지가 열리는 것을 확인했다.
+- 측정 중 화면이 꺼져 있어 창 캡처(`capture.ps1`)로 이미지 보기를 눈으로 확인하지 못했다(미해결 U-34).
+
 ### 6.2 안정성
 
 - 포맷 파서는 워커에서 `catch_unwind`로 격리 → 패닉 시 오류 화면. 창 프로시저·PDF 스레드의 패닉도 잡아 문서를 닫고 오류 화면을 띄운다(앱은 계속 동작). 이를 위해 release에서도 `panic = "unwind"`를 유지한다. 패닉은 `logs\crash.log`에 남긴다.
@@ -526,6 +564,7 @@ release 빌드, 각 3–5회 실행의 대표값. 측정 스크립트 `perf/meas
 | Ctrl+U | MD 원문 보기 ↔ 렌더링 (8MB 넘는 MD는 원문으로 열리고 Ctrl+U로 렌더링) |
 | Ctrl+휠 · Ctrl+`+`/`-`/`0` | 확대 · 축소 · 기본 배율(PDF 폭 맞춤, TXT 100%) |
 | Ctrl+1 · Ctrl+2 | 실제 크기(100%) · 쪽 맞춤 (PDF) |
+| Ctrl+0 · Ctrl+1 · 끌기 | 창에 맞춤 · 실제 픽셀 · 끌어서 이동 (이미지) |
 | PgUp/PgDn · Space/Shift+Space | 이전/다음 쪽 · 한 화면 아래/위 (PDF) |
 | Ctrl+C · Ctrl+A · Esc | 선택 복사 · 전체 선택 · 선택 해제 / 찾기 막대 닫기 |
 | Alt+← / Alt+→ · 마우스 X1/X2 | 뒤로 / 앞으로 (다른 문서 열기, MD 앵커·PDF 문서 안 링크 이동을 기록) |
@@ -598,6 +637,7 @@ panic = "unwind"            # 파서 패닉 격리 (§6.2)
 - PDFium 바이너리: `bblanchon/pdfium-binaries`의 V8/XFA 미포함 빌드.
 - 배포 형태는 개인용 포터블 zip으로 결정(§12 Q4). 설치형(MSI/winget), 코드 서명, 자동 업데이트는 하지 않는다.
 - 설정·세션 파일은 `%APPDATA%`·`%LOCALAPPDATA%`에 둔다(§8). exe 폴더에 쓰지 않으므로 어느 위치에 풀어도 동작한다.
+- **패키지 만들기:** `.\tools\package.ps1` → `dist\LeafViewer-<버전>-win-x64.zip`(`LeafViewer.exe`·`pdfium.dll`·`README.txt`·`THIRD-PARTY-NOTICES.txt`). 고지 파일은 `cargo metadata`로 실행 파일에 들어간 크레이트(일반 의존성만)를 찾아 라이선스 원문을 모은다. PDFium 라이선스 원문은 `-PdfiumLicense <pdfium-binaries의 LICENSE>`로 넣는다(없으면 요약과 링크만). `pdfium.dll` 기본 위치는 `target\release\`.
 
 ---
 
@@ -607,7 +647,7 @@ panic = "unwind"            # 파서 패닉 격리 (§6.2)
 |---|---|
 | 단위 테스트 | 코어·포맷 크레이트: 인코딩 감지 표본, 희소 인덱스, 정렬, MD → IR 스냅샷(`insta`) |
 | 레이아웃 테스트 | 가짜 `Measurer`로 블록 높이·가상화·스크롤 보정·표 열 폭 검증 (`leaf-layout`) |
-| 테스트 코퍼스 `testdata/` | CP949·UTF-16 TXT, 1GB 생성 스크립트, 매우 긴 한 줄, GFM 전 요소 MD, 깨진 MD, 대형·암호·손상 PDF, 260자 초과 경로. PDF는 `gen_pdf.py`가 생성(목차·링크 30쪽, 500쪽, 크기 혼합), TXT는 `gen_txt.py`가 생성(UTF-8·CP949·UTF-16 LE/BE, 5MB 한 줄, 64MB, `--huge` 1GB), MD는 `gen_md.py`가 생성(GFM 전 요소·이미지 5종·문서 간 링크, 깨진 MD, 1MB·6MB·9MB) — 결과물 `testdata/out/`은 커밋하지 않는다 |
+| 테스트 코퍼스 `testdata/` | CP949·UTF-16 TXT, 1GB 생성 스크립트, 매우 긴 한 줄, GFM 전 요소 MD, 깨진 MD, 대형·암호·손상 PDF, 260자 초과 경로. PDF는 `gen_pdf.py`가 생성(목차·링크 30쪽, 500쪽, 크기 혼합), TXT는 `gen_txt.py`가 생성(UTF-8·CP949·UTF-16 LE/BE, 5MB 한 줄, 64MB, `--huge` 1GB), MD는 `gen_md.py`가 생성(GFM 전 요소·이미지 5종·문서 간 링크, 깨진 MD, 1MB·6MB·9MB), 이미지는 `gen_img.py`가 생성(6000×4000·8000×600 격자 PNG, 도트·투명 PNG, BMP, GIF 애니메이션, EXIF 방향 6 JPEG, 확장자 없는 PNG, 잘린 PNG) — 결과물 `testdata/out/`은 커밋하지 않는다 |
 | 성능 측정 `perf/` | PowerShell 스크립트로 첫 페인트 시간(앱 로그 타임스탬프)과 메모리(`WorkingSet64`, `PrivateMemorySize64`)를 시나리오별로 CSV 기록 → 회귀 감지. `measure.ps1`(첫 화면·메모리), `bench-scroll.ps1`(PDF·TXT 스크롤 프레임 시간·최대 메모리), `capture.ps1`(창 조작 후 캡처, `syskey:`로 Alt 조합). TXT 처리량은 `leaf-fmt-text`의 `examples/bench.rs`(행 순회·디코딩·색인·찾기) |
 | 퍼징 (P2) | `cargo-fuzz`로 TXT·MD 파서 |
 
@@ -622,7 +662,7 @@ panic = "unwind"            # 파서 패닉 격리 (§6.2)
 | **M2** ✅ | TXT 뷰어 | FR-T P0 전부, 찾기, 선택·복사 — 완료(§6.1.3). FR-T09(줄 이동)도 구현, 탭 폭은 기본 4로 고정(설정은 M4). 남은 TXT 항목: 인코딩 수동 지정(FR-T07, P1), 줄 번호(FR-T08, P1), 파일 변경 시 새로고침·매핑 해제(FR-V06, M4 파일 감시), tail(FR-T11, P2). MD는 M3 전까지 원문을 TXT 보기로 표시 |
 | **M3** ✅ | MD 뷰어 | Flow IR, 가상화 레이아웃 엔진, 이미지, 링크, 목차 — 완료(§6.1.4). FR-M01~M07·M09·M10도 구현(찾기·선택/복사·위치 복원 포함). 남은 MD 항목: SVG(FR-M11, P1), front matter 펼쳐 보기(FR-M08, P1 — 지금은 항상 숨김), 알림 블록(FR-M13, P2), 원격 이미지 클릭 로드(FR-M14, P2), 뒤로/앞으로(FR-V02)는 M4. 포맷 레지스트리(§4.3)는 아직 확장자 분기 |
 | **M4** ✅ | 다듬기 | 다크 모드(시스템 따름·실시간 전환), 파일 감시(트리 diff·문서 자동 새로고침·설정 즉시 반영), 설정 파일, 오류 처리(패닉 복구·crash.log), 뒤로/앞으로, 사이드바 끌기·접기, 트리 가상 목록(Q9), 우클릭 메뉴, 단일 인스턴스, 외부 편집기 — 완료(§6.1.5). 남은 항목: 진행 표시(FR-V01), 최근 문서 캐시, 고대비, Q11 |
-| M5 | v1.0 | 포터블 배포 패키지. 확장성 검증으로 포맷 1개 추가(예: 이미지) |
+| **M5** ✅ | v1.0 | 포맷 레지스트리(§4.3 구현 메모), 확장성 검증으로 이미지 포맷 추가(FR-I, §5.7), 포터블 배포 패키지(`tools/package.ps1`, §9) — 완료(§6.1.6). 남은 이미지 항목: GIF 재생, 이미지 복사, 투명 체크무늬, 색 프로필 |
 
 ---
 
@@ -637,7 +677,7 @@ panic = "unwind"            # 파서 패닉 격리 (§6.2)
 | ~~Q3~~ | ~~폴더 전체 텍스트 검색이 필요한가?~~ | **결정(v0.3): 기본안.** v1.x에서, 상주 인덱스 없이 요청 시 스캔(ripgrep 방식) | — |
 | ~~Q4~~ | ~~개인용인가, 공개 배포인가?~~ | **결정(v0.3): 기본안.** 개인용 포터블 zip. 설치형·코드 서명·자동 업데이트 없음 | — |
 | ~~Q5~~ | ~~최소 OS를 Windows 10 1809+로 해도 되는가?~~ | **결정(v0.4): Windows 11 x64만 지원.** 개인용이고 사용 환경이 Windows 11이므로 Windows 10 호환 분기·테스트를 하지 않는다 | — |
-| Q6 | 이후 추가할 확장자 후보는? (이미지, 소스 코드, csv, epub, docx, hwp/hwpx …) | 이미지 · 소스 코드 우선 | IR·핸들러 설계 범위 |
+| Q6 | 이후 추가할 확장자 후보는? (소스 코드, csv, epub, docx, hwp/hwpx …) | 이미지는 M5에서 추가. 다음은 소스 코드(TXT 보기 + 구문 강조 v1.1) | IR·핸들러 설계 범위 |
 | ~~Q7~~ | ~~§6.1 성능 목표 수치가 기대에 맞는가?~~ | **결정(v0.4): 표 그대로 확정** | — |
 | ~~Q8~~ | ~~D2D 렌더 타깃 기본값: 하드웨어는 GPU 드라이버 때문에 유휴 메모리 목표(≤25MB)를 넘고, 소프트웨어는 충족한다(§6.1.1)~~ | **결정(v0.6): 소프트웨어 기본**(G1 > G2). 설정 `[general] gpu = true`로 GPU 사용(설정 파일 구현 전까지는 환경 변수 `LEAF_D2D_GPU=1`). M1에서 PDF 스크롤 60fps(NFR-P07)를 SW로 실측해 미달이면 재논의 | NFR-P02 · NFR-P07 |
 | ~~Q9~~ | ~~TreeView 대량 삽입이 느리다(1만 항목 ≈ 320ms)~~ | **해결(v0.10):** 직접 그리는 가상 목록(GDI)으로 교체. 1만 항목 펼치기 ≈ 20ms(§6.1.5) | — |
@@ -650,6 +690,7 @@ panic = "unwind"            # 파서 패닉 격리 (§6.2)
 
 | 버전 | 날짜 | 내용 |
 |---|---|---|
+| v1.0 | 2026-11-21 | M5 완료: 포맷 레지스트리(`leaf_doc::format`·`leaf_core::format`, 내용 판별), 전용 보기 공통 경로(`CustomView`), 이미지 포맷(`leaf-fmt-image` + WIC, EXIF 방향, 영역 디코딩), 포터블 zip 스크립트(`tools/package.ps1`), 버전 1.0.0. §4.1·§4.3·§5.7·§6.1.6·§7.2·§9·§10·§11 갱신 |
 | v0.10 | 2026-11-21 | M4 완료: 설정 파일(`leaf-core::config`, 실시간 반영), 라이트/다크 테마, 파일 감시(`notify`), 트리 모델 `leaf-core::tree` + 가상 목록(Q9 해결), 뒤로/앞으로, 사이드바 끌기·접기, 우클릭 메뉴, 단일 인스턴스, 외부 편집기, 패닉 복구. 실측 §6.1.5, §6.2·§7·§8 보강 |
 | v0.9 | 2026-11-21 | M3 완료: MD 뷰어(`leaf-fmt-markdown` pulldown-cmark → Flow IR, `leaf-layout` 가상화 레이아웃, DirectWrite 측정·인라인 객체, WIC 이미지, 링크·앵커·트리 동기화, 목차, 찾기·선택/복사, Ctrl+U 원문, 큰 MD 원문 열기). 실측 §6.1.4, §4.4 구현 메모, 메모리 정책(§4.5)·단축키(§7.2)·테스트(§10) 보강 |
 | v0.8 | 2026-11-21 | M2 완료: TXT 뷰어(인코딩 감지, mmap + 희소 줄 색인, 긴 줄 분할, 자동 줄바꿈, 찾기·선택/복사, 줄 이동, 세션 위치). 실측 §6.1.3, 메모리 정책(§4.5)·단축키(§7.2)·테스트(§10) 보강, Q11 추가 |

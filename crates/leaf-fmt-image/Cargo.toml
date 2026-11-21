@@ -1,0 +1,10 @@
+[package]
+name = "leaf-fmt-image"
+description = "이미지 포맷 — 형식 판별, EXIF 방향, 확대·스크롤 배치 (디코딩은 leaf-win의 WIC)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+leaf-doc.workspace = true

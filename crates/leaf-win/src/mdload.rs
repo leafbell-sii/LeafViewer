@@ -220,11 +220,11 @@ impl Drop for ComInit {
     }
 }
 
-fn factory() -> Result<IWICImagingFactory> {
+pub(crate) fn factory() -> Result<IWICImagingFactory> {
     unsafe { CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER) }
 }
 
-fn open_frame(f: &IWICImagingFactory, path: &Path) -> Result<IWICBitmapFrameDecode> {
+pub(crate) fn open_frame(f: &IWICImagingFactory, path: &Path) -> Result<IWICBitmapFrameDecode> {
     let wp = wide(path);
     unsafe {
         let stream = SHCreateStreamOnFileEx(

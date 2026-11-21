@@ -4,6 +4,12 @@
 mod app;
 mod bar;
 mod chrome;
+// 전용 보기 포맷이 하나도 없는 빌드(--no-default-features)에서는 쓰이지 않는다
+#[cfg_attr(not(feature = "fmt-image"), allow(dead_code))]
+mod custom;
+mod formats;
+#[cfg(feature = "fmt-image")]
+mod imageview;
 mod mdload;
 mod mdview;
 mod pdfview;
