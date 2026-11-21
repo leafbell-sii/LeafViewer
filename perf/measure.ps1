@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   M0 성능 측정 (SPEC §6.1, §10). 새 프로세스를 띄워 첫 화면 시간과 메모리를 기록한다.
 
@@ -21,7 +21,7 @@ New-Item -ItemType Directory -Force $outDir | Out-Null
 $csv = Join-Path $outDir ("m0-{0:yyyyMMdd-HHmmss}.csv" -f (Get-Date))
 
 $rows = for ($i = 1; $i -le $Runs; $i++) {
-    $argList = @()
+    $argList = @('--new-instance')
     if ($Target) { $argList += "`"$Target`"" }
     $p = if ($argList) { Start-Process $exe -ArgumentList $argList -PassThru } else { Start-Process $exe -PassThru }
     Start-Sleep -Milliseconds $SettleMs

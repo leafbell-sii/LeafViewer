@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   PDF·TXT·MD 연속 스크롤 벤치마크 (NFR-P07 60fps, NFR-P06 열람 중 메모리).
   `--bench-scroll`로 실행하면 앱이 첫 쪽 표시 후 16ms마다 40DIP씩 끝까지(최대 600틱) 내리며
@@ -13,7 +13,7 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $log = Join-Path $env:LOCALAPPDATA 'LeafViewer\logs\perf.log'
-$p = Start-Process (Resolve-Path $Exe) -ArgumentList '--bench-scroll', "`"$((Resolve-Path $Target).Path)`"" -PassThru
+$p = Start-Process (Resolve-Path $Exe) -ArgumentList '--bench-scroll', '--new-instance', "`"$((Resolve-Path $Target).Path)`"" -PassThru
 $peakPriv = 0; $peakWs = 0; $samples = @()
 $deadline = (Get-Date).AddSeconds($TimeoutSec)
 while (-not $p.HasExited -and (Get-Date) -lt $deadline) {

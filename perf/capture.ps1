@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   LeafViewer를 띄우고, 창에 메시지를 보내 조작한 뒤 창을 PNG로 캡처한다 (D2D 내용 포함).
 
@@ -48,7 +48,7 @@ public static class W {
 }
 "@
 [W]::SetThreadDpiAwarenessContext([IntPtr]-4) | Out-Null  # PER_MONITOR_AWARE_V2: 실제 픽셀 크기
-$p = if ($Target) { Start-Process (Resolve-Path $Exe) -ArgumentList "`"$Target`"" -PassThru } else { Start-Process (Resolve-Path $Exe) -PassThru }
+$p = if ($Target) { Start-Process (Resolve-Path $Exe) -ArgumentList '--new-instance', "`"$Target`"" -PassThru } else { Start-Process (Resolve-Path $Exe) -ArgumentList '--new-instance' -PassThru }
 Start-Sleep -Milliseconds $SettleMs
 $p.Refresh()
 $h = $p.MainWindowHandle
@@ -71,7 +71,7 @@ function Get-ChildAt([int]$x, [int]$y) {
         $cur = $child
     }
 }
-$vk = @{ F3 = 0x72; RETURN = 0x0D; ESCAPE = 0x1B; NEXT = 0x22; PRIOR = 0x21; DOWN = 0x28; UP = 0x26; HOME = 0x24; END = 0x23; SPACE = 0x20; Z = 0x5A }
+$vk = @{ F3 = 0x72; RETURN = 0x0D; ESCAPE = 0x1B; NEXT = 0x22; PRIOR = 0x21; DOWN = 0x28; UP = 0x26; HOME = 0x24; END = 0x23; SPACE = 0x20; Z = 0x5A; LEFT = 0x25; RIGHT = 0x27; F5 = 0x74; B = 0x42 }
 foreach ($a in $Actions) {
     $kind, $arg = $a -split ':', 2
     switch ($kind) {

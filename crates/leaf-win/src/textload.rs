@@ -13,9 +13,6 @@ use windows::Win32::System::Memory::{
     UnmapViewOfFile,
 };
 
-/// 이 크기 이상이면 메모리 매핑 (설정 `[text] mmap_threshold_mb`, §8)
-pub const MMAP_THRESHOLD: u64 = 16 << 20;
-
 struct MappedFile {
     base: MEMORY_MAPPED_VIEW_ADDRESS,
     len: usize,
@@ -64,11 +61,12 @@ pub struct Loaded {
 }
 
 /// 워커에서 호출. std의 `File::open`은 READ|WRITE|DELETE 공유로 연다 (§6.2).
-pub fn load(path: &Path) -> Result<Loaded, String> {
+/// `mmap_threshold` 이상이면 메모리 매핑 (설정 `[text] mmap_threshold_mb`, §4.5).
+pub fn load(path: &Path, mmap_threshold: u64) -> Result<Loaded, String> {
     use std::io::Read;
     let mut f = std::fs::File::open(path).map_err(|e| e.to_string())?;
     let size = f.metadata().map_err(|e| e.to_string())?.len();
-    let mapped = size >= MMAP_THRESHOLD;
+    let mapped = size >= mmap_threshold;
     let src: Arc<dyn Source> = if mapped {
         Arc::new(map_file(&f, size)?)
     } else {

@@ -21,18 +21,27 @@ use crate::render::{self, Target, rgb};
 
 /// 쪽 텍스트·링크 캐시 크기(쪽 수)
 const TEXT_CACHE_PAGES: usize = 64;
-const BITMAP_BUDGET_MIN: usize = 64 * 1024 * 1024;
+
 const LINE_STEP: f32 = 40.0;
 const CLICK_SLOP: f32 = 4.0;
 
 pub enum Cmd {
     Render(Vec<TileSpec>),
     PageInfo(Vec<u32>),
-    Search { id: u64, query: String, start: u32 },
+    Search {
+        id: u64,
+        query: String,
+        start: u32,
+    },
     CancelSearch,
-    Copy { from: TextPos, to: TextPos },
+    Copy {
+        from: TextPos,
+        to: TextPos,
+    },
     SetClipboard(String),
     OpenUri(String),
+    /// 문서 안 링크로 이동했다: 이동 전 위치를 뒤로 가기 기록에 (FR-V02)
+    Jumped(FilePos),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -99,6 +108,8 @@ pub struct PdfView {
     first_page_logged: bool,
     /// 마지막 프레임에서 보이는 쪽이 모두 고해상도였는지 (벤치마크용)
     pub last_frame_complete: bool,
+    /// 비트맵 캐시 최소 예산 (설정 `[pdf] bitmap_cache_mb`, §4.5)
+    bitmap_budget: usize,
     render_ms_total: f64,
     tiles_rendered: u32,
 }
@@ -108,6 +119,7 @@ fn order(a: TextPos, b: TextPos) -> (TextPos, TextPos) {
 }
 
 impl PdfView {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         generation: u64,
         path: PathBuf,
@@ -115,20 +127,23 @@ impl PdfView {
         outline: Vec<OutlineItem>,
         opened_at: Instant,
         timings: String,
+        bitmap_budget: usize,
+        default_zoom: ZoomMode,
     ) -> Self {
         Self {
             generation,
             path,
             outline,
             layout: PageLayout::new(sizes),
-            zoom_mode: ZoomMode::FitWidth,
+            zoom_mode: default_zoom,
             sx: 0.0,
             sy: 0.0,
             vw: 0.0,
             vh: 0.0,
             dpi: 96.0,
             epoch: 0,
-            tiles: BudgetLru::new(BITMAP_BUDGET_MIN),
+            tiles: BudgetLru::new(bitmap_budget),
+            bitmap_budget,
             visible_keys: Vec::new(),
             sent_tiles: Vec::new(),
             pages: BudgetLru::new(TEXT_CACHE_PAGES),
@@ -179,7 +194,8 @@ impl PdfView {
         // 비트맵 예산 = max(64MB, 뷰포트 바이트 × 3) (SPEC §4.5)
         let k = dpi / 96.0;
         let view_bytes = (vw * k * vh * k * 4.0) as usize;
-        self.tiles.set_budget(BITMAP_BUDGET_MIN.max(view_bytes * 3));
+        self.tiles
+            .set_budget(self.bitmap_budget.max(view_bytes * 3));
         self.clamp();
     }
 
@@ -343,6 +359,7 @@ impl PdfView {
             },
             offset: 0,
             view: "pdf".into(),
+            wrap: None,
         }
     }
 
@@ -592,8 +609,9 @@ impl PdfView {
         }
         match p.link? {
             LinkTarget::Internal(d) => {
+                let before = self.position();
                 self.go_to(d);
-                None
+                Some(Cmd::Jumped(before))
             }
             LinkTarget::Uri(u) => Some(Cmd::OpenUri(u)),
         }
@@ -640,7 +658,7 @@ impl PdfView {
         self.visible_keys.clear();
         let sel = self.selection.map(|(a, b)| order(a, b));
 
-        unsafe { t.rt.Clear(Some(&rgb(render::COLOR_PDF_BG))) };
+        unsafe { t.rt.Clear(Some(&rgb(t.pal.pdf_bg))) };
         let mut frame_complete = !range.is_empty();
         for page in range.clone() {
             let p32 = page as u32;

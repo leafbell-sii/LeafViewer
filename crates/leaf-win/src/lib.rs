@@ -3,13 +3,15 @@
 
 mod app;
 mod bar;
+mod chrome;
 mod mdload;
 mod mdview;
 mod pdfview;
 mod render;
 mod textload;
 mod textview;
-mod tree;
+mod theme;
+mod treelist;
 mod util;
 
 use std::path::PathBuf;
@@ -21,6 +23,8 @@ pub struct StartOptions {
     pub pdfium_path: PathBuf,
     /// `--bench-scroll`: 문서(PDF·TXT) 첫 화면이 뜨면 자동으로 끝까지 스크롤하며 프레임 시간을 기록하고 종료 (NFR-P07)
     pub bench_scroll: bool,
+    /// `--new-instance`: 단일 인스턴스 설정과 상관없이 새 창으로 (측정 스크립트용)
+    pub new_instance: bool,
 }
 
 pub fn run(opts: StartOptions) -> windows::core::Result<()> {

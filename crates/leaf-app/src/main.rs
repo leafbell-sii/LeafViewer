@@ -14,9 +14,11 @@ fn main() {
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
         .unwrap_or_default();
     let bench_scroll = std::env::args_os().any(|a| a == "--bench-scroll");
+    let new_instance = std::env::args_os().any(|a| a == "--new-instance");
     let opts = leaf_win::StartOptions {
         path,
         bench_scroll,
+        new_instance,
         pdfium_path: exe_dir.join("pdfium.dll"),
     };
     if let Err(e) = leaf_win::run(opts) {

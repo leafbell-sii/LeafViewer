@@ -17,17 +17,23 @@ use leaf_fmt_text::search::Hit;
 use leaf_fmt_text::{LineIndex, Pos, TextDoc};
 use windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F;
 use windows::Win32::Graphics::DirectWrite::*;
-use windows::core::{BOOL, Result, w};
+use windows::core::{BOOL, PCWSTR, Result, w};
 
 use crate::pdfview::CursorKind;
 use crate::render::{self, Target};
 
 pub const MARGIN: f32 = 16.0;
 const PAD_Y: f32 = 8.0;
-/// FR-T04: 고정폭 폰트(Consolas), 한글은 DirectWrite 대체 폰트
-const FONT_PT: f32 = 11.0;
-/// FR-T10 기본값
-const TAB_WIDTH: f32 = 4.0;
+/// TXT 보기 서식 (설정 `[text]`, FR-T04·T10). 한글은 DirectWrite 대체 폰트가 맡는다.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TextStyle {
+    /// NUL로 끝나는 UTF-16 글꼴 이름
+    pub font: Vec<u16>,
+    pub size_pt: f32,
+    pub tab_width: f32,
+    /// 자동 줄바꿈 기본값 (파일별로 기억한 값이 우선)
+    pub wrap: bool,
+}
 const ZOOM_MIN: f32 = 0.5;
 const ZOOM_MAX: f32 = 4.0;
 /// 레이아웃 캐시 예산 (UTF-16 단위 수)
@@ -94,6 +100,7 @@ pub struct TextView {
     space_w: f32,
     zoom: f32,
     wrap: bool,
+    style: TextStyle,
     anchor: usize,
     y_off: f32,
     sx: f32,
@@ -109,9 +116,12 @@ pub struct TextView {
     line_cache: Option<(usize, u64)>,
     opened_at: Instant,
     pub first_paint_ms: Option<f64>,
+    /// 메모리 매핑으로 연 파일 (파일이 바뀌면 매핑을 먼저 놓는다, §4.5)
+    pub mapped: bool,
 }
 
 impl TextView {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         generation: u64,
         path: PathBuf,
@@ -119,9 +129,11 @@ impl TextView {
         size: u64,
         index: Option<LineIndex>,
         dwrite: IDWriteFactory,
+        style: TextStyle,
         opened_at: Instant,
     ) -> Self {
         let anchor = doc.start();
+        let wrap = style.wrap;
         Self {
             generation,
             path,
@@ -134,7 +146,8 @@ impl TextView {
             format: None,
             space_w: 8.0,
             zoom: 1.0,
-            wrap: true,
+            wrap,
+            style,
             anchor,
             y_off: 0.0,
             sx: 0.0,
@@ -150,7 +163,12 @@ impl TextView {
             line_cache: None,
             opened_at,
             first_paint_ms: None,
+            mapped: false,
         }
+    }
+
+    pub fn is_mapped(&self) -> bool {
+        self.mapped
     }
 
     pub fn set_index(&mut self, ix: LineIndex) {
@@ -183,12 +201,12 @@ impl TextView {
         }
         unsafe {
             let f = self.dwrite.CreateTextFormat(
-                w!("Consolas"),
+                PCWSTR(self.style.font.as_ptr()),
                 None,
                 DWRITE_FONT_WEIGHT_NORMAL,
                 DWRITE_FONT_STYLE_NORMAL,
                 DWRITE_FONT_STRETCH_NORMAL,
-                FONT_PT * 96.0 / 72.0 * self.zoom,
+                self.style.size_pt * 96.0 / 72.0 * self.zoom,
                 w!("ko-KR"),
             )?;
             f.SetWordWrapping(if self.wrap {
@@ -202,7 +220,7 @@ impl TextView {
             let mut m = DWRITE_TEXT_METRICS::default();
             sp.GetMetrics(&mut m)?;
             self.space_w = m.widthIncludingTrailingWhitespace.max(1.0);
-            f.SetIncrementalTabStop(self.space_w * TAB_WIDTH)?;
+            f.SetIncrementalTabStop(self.space_w * self.style.tab_width)?;
             self.format = Some(f.clone());
             self.layouts.clear();
             Ok(f)
@@ -210,7 +228,7 @@ impl TextView {
     }
 
     fn line_h(&self) -> f32 {
-        FONT_PT * 96.0 / 72.0 * self.zoom * 1.25
+        self.style.size_pt * 96.0 / 72.0 * self.zoom * 1.25
     }
 
     fn make_layout(&mut self, pos: usize) -> Result<()> {
@@ -473,6 +491,7 @@ impl TextView {
             zoom: format!("{:.4}", self.zoom),
             offset: self.anchor as u64,
             view: "txt".into(),
+            wrap: Some(self.wrap),
         }
     }
 
@@ -482,6 +501,11 @@ impl TextView {
         }
         if let Ok(z) = pos.zoom.parse::<f32>() {
             self.zoom = z.clamp(ZOOM_MIN, ZOOM_MAX);
+        }
+        if let Some(w) = pos.wrap {
+            self.wrap = w;
+            self.format = None;
+            self.layouts.clear();
         }
         self.anchor = self.doc.row_containing(pos.offset as usize);
         self.y_off = pos.y_pt.max(0.0);
