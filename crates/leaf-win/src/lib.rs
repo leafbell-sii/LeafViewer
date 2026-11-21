@@ -2,6 +2,8 @@
 //! 워크스페이스에서 `unsafe`가 허용되는 유일한 크레이트다 (SPEC §3.4).
 
 mod app;
+mod bar;
+mod pdfview;
 mod render;
 mod tree;
 mod util;
@@ -13,6 +15,8 @@ pub struct StartOptions {
     pub path: Option<PathBuf>,
     /// `pdfium.dll` 경로. 첫 PDF를 열 때만 로드한다.
     pub pdfium_path: PathBuf,
+    /// `--bench-scroll`: PDF 첫 쪽이 뜨면 자동으로 끝까지 스크롤하며 프레임 시간을 기록하고 종료 (NFR-P07)
+    pub bench_scroll: bool,
 }
 
 pub fn run(opts: StartOptions) -> windows::core::Result<()> {

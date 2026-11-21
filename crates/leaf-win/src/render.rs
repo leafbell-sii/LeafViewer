@@ -19,6 +19,10 @@ pub fn rgb(hex: u32) -> D2D1_COLOR_F {
     }
 }
 
+pub fn rgba(hex: u32, a: f32) -> D2D1_COLOR_F {
+    D2D1_COLOR_F { a, ..rgb(hex) }
+}
+
 pub const COLOR_BG: u32 = 0xFFFFFF;
 pub const COLOR_TEXT: u32 = 0x1F1F1F;
 pub const COLOR_DIM: u32 = 0x6B6B6B;
@@ -35,6 +39,11 @@ pub struct Target {
     pub text: ID2D1SolidColorBrush,
     pub dim: ID2D1SolidColorBrush,
     pub placeholder: ID2D1SolidColorBrush,
+    pub page_border: ID2D1SolidColorBrush,
+    /// 찾기 일치 항목 / 현재 항목 / 선택 영역 (반투명)
+    pub hit: ID2D1SolidColorBrush,
+    pub hit_current: ID2D1SolidColorBrush,
+    pub selection: ID2D1SolidColorBrush,
     /// 타깃이 다시 만들어질 때마다 증가 → 이 타깃에서 만든 비트맵이 아직 유효한지 판별
     pub epoch: u64,
 }
@@ -151,12 +160,20 @@ impl Renderer {
                 let text = rt.CreateSolidColorBrush(&rgb(COLOR_TEXT), None)?;
                 let dim = rt.CreateSolidColorBrush(&rgb(COLOR_DIM), None)?;
                 let placeholder = rt.CreateSolidColorBrush(&rgb(COLOR_PLACEHOLDER), None)?;
+                let page_border = rt.CreateSolidColorBrush(&rgb(0xC8C8C8), None)?;
+                let hit = rt.CreateSolidColorBrush(&rgba(0xFFD400, 0.40), None)?;
+                let hit_current = rt.CreateSolidColorBrush(&rgba(0xFF7A00, 0.55), None)?;
+                let selection = rt.CreateSolidColorBrush(&rgba(0x2F7BFF, 0.30), None)?;
                 self.epoch += 1;
                 self.target = Some(Target {
                     rt,
                     text,
                     dim,
                     placeholder,
+                    page_border,
+                    hit,
+                    hit_current,
+                    selection,
                     epoch: self.epoch,
                 });
             }
@@ -208,6 +225,10 @@ pub fn draw_layout(
             D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT,
         )
     };
+}
+
+pub fn fill(t: &Target, r: leaf_doc::RectF, brush: &ID2D1SolidColorBrush) {
+    unsafe { t.rt.FillRectangle(&rect(r.l, r.t, r.r, r.b), brush) };
 }
 
 pub fn rect(l: f32, t: f32, r: f32, b: f32) -> D2D_RECT_F {

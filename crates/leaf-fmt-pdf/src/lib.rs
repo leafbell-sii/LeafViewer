@@ -3,54 +3,99 @@
 //! - `pdfium.dll`은 **첫 PDF를 열 때** 로드한다. PDF를 보지 않는 세션의 비용은 0.
 //! - PDFium 호출은 **전용 스레드 하나**에서만 한다 — 이 스레드도 첫 요청 때 만든다.
 //! - 결과는 `notify` 콜백으로 넘긴다. UI는 콜백 안에서 채널 전송 + `PostMessageW`만 한다.
+//! - 작업 우선순위: 렌더 타일 → 쪽 텍스트/링크 → 복사 → 검색(쪽 하나씩). 새 요청이 오면
+//!   진행 중인 목록을 최신 것으로 바꾼다 — 스크롤 중 화면 밖으로 나간 쪽은 그리지 않는다.
 #![forbid(unsafe_code)]
 
+mod engine;
+
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::Instant;
 
-use crossbeam_channel::{Receiver, Sender, unbounded};
-use pdfium_render::prelude::*;
+use crossbeam_channel::{Sender, unbounded};
+pub use leaf_doc::paged::{TileKey, TileSpec};
+use leaf_doc::text::PageText;
+use leaf_doc::{Link, OutlineItem, RectF};
 
 /// 요청 세대 번호 (SPEC §4.2). 문서를 바꿀 때마다 증가시키고, 다른 세대의 결과는 버린다.
 pub type Generation = u64;
+
+/// 텍스트 위치: (쪽, 글자 인덱스). 인덱스 `usize::MAX`는 "쪽 끝".
+pub type TextPos = (u32, usize);
 
 #[derive(Debug)]
 pub enum PdfEvent {
     Opened {
         generation: Generation,
-        page_count: u32,
-        /// 첫 페이지 크기(pt). 레이아웃 추정용.
-        page_size_pt: (f32, f32),
+        /// 쪽 크기(pt)
+        page_sizes: Vec<(f32, f32)>,
+        outline: Vec<OutlineItem>,
         /// 이 요청에서 DLL 바인딩에 걸린 시간 (이미 로드돼 있으면 0)
         bind_ms: f64,
         load_ms: f64,
     },
-    Rendered {
+    Tile {
         generation: Generation,
-        page: u32,
-        width: u32,
-        height: u32,
+        spec: TileSpec,
         stride: u32,
         /// BGRA, 불투명(흰 배경)
         bgra: Vec<u8>,
         render_ms: f64,
     },
+    PageInfo {
+        generation: Generation,
+        page: u32,
+        text: PageText,
+        links: Vec<Link>,
+    },
+    SearchHits {
+        generation: Generation,
+        search_id: u64,
+        page: u32,
+        /// 일치 항목별 (글자 범위, 줄 단위 사각형 pt)
+        hits: Vec<(Range<usize>, Vec<RectF>)>,
+    },
+    SearchDone {
+        generation: Generation,
+        search_id: u64,
+    },
+    Copied {
+        generation: Generation,
+        text: String,
+    },
     Error {
         generation: Generation,
         message: String,
+        /// 암호가 필요한 문서 (FR-P08, P1 — 아직 입력 대화상자는 없다)
+        password: bool,
     },
 }
 
-enum Req {
+pub(crate) enum Req {
     Open {
         generation: Generation,
         path: PathBuf,
     },
     Render {
         generation: Generation,
-        page: u32,
-        target_width_px: u32,
+        tiles: Vec<TileSpec>,
+    },
+    PageInfo {
+        generation: Generation,
+        pages: Vec<u32>,
+    },
+    Search {
+        generation: Generation,
+        search_id: u64,
+        query: String,
+        start_page: u32,
+    },
+    CancelSearch,
+    Copy {
+        generation: Generation,
+        from: TextPos,
+        to: TextPos,
     },
     Close,
 }
@@ -75,10 +120,6 @@ impl PdfEngine {
         }
     }
 
-    pub fn is_started(&self) -> bool {
-        self.tx.is_some()
-    }
-
     pub fn open(&mut self, generation: Generation, path: &Path) {
         self.send(Req::Open {
             generation,
@@ -86,11 +127,37 @@ impl PdfEngine {
         });
     }
 
-    pub fn render(&mut self, generation: Generation, page: u32, target_width_px: u32) {
-        self.send(Req::Render {
+    /// 지금 필요한 타일 목록 전체. 이전에 보낸 목록 중 아직 안 그린 것은 버려진다.
+    pub fn render(&mut self, generation: Generation, tiles: Vec<TileSpec>) {
+        self.send(Req::Render { generation, tiles });
+    }
+
+    /// 쪽 텍스트·링크 요청 (지금 필요한 쪽 전체, 이전 목록을 대체).
+    pub fn page_info(&mut self, generation: Generation, pages: Vec<u32>) {
+        self.send(Req::PageInfo { generation, pages });
+    }
+
+    /// 문서 전체 찾기. `start_page`부터 끝까지, 이어서 처음부터 돌아온다. 결과는 쪽마다 스트리밍.
+    pub fn search(&mut self, generation: Generation, search_id: u64, query: &str, start_page: u32) {
+        self.send(Req::Search {
             generation,
-            page,
-            target_width_px: target_width_px.max(1),
+            search_id,
+            query: query.to_owned(),
+            start_page,
+        });
+    }
+
+    pub fn cancel_search(&mut self) {
+        if self.tx.is_some() {
+            self.send(Req::CancelSearch);
+        }
+    }
+
+    pub fn copy(&mut self, generation: Generation, from: TextPos, to: TextPos) {
+        self.send(Req::Copy {
+            generation,
+            from,
+            to,
         });
     }
 
@@ -109,7 +176,7 @@ impl PdfEngine {
             self.handle = Some(
                 thread::Builder::new()
                     .name("leaf-pdfium".into())
-                    .spawn(move || pdf_thread(lib, rx, notify))
+                    .spawn(move || engine::run(lib, rx, notify))
                     .expect("spawn pdf thread"),
             );
             self.tx = Some(tx);
@@ -127,155 +194,4 @@ impl Drop for PdfEngine {
             let _ = h.join();
         }
     }
-}
-
-fn ms(t: Instant) -> f64 {
-    t.elapsed().as_secs_f64() * 1000.0
-}
-
-/// 대기 중인 요청을 모아 최신 것만 남긴다: 빠르게 문서를 넘길 때 중간 문서는 열지 않는다.
-fn coalesce(first: Req, rx: &Receiver<Req>) -> Vec<Req> {
-    let mut open: Option<Req> = None;
-    let mut render: Option<Req> = None;
-    let mut close = false;
-    let mut push = |r: Req| match r {
-        Req::Open { .. } => {
-            open = Some(r);
-            render = None;
-            close = false;
-        }
-        Req::Render { .. } => render = Some(r),
-        Req::Close => {
-            open = None;
-            render = None;
-            close = true;
-        }
-    };
-    push(first);
-    while let Ok(r) = rx.try_recv() {
-        push(r);
-    }
-    let mut out = Vec::new();
-    if close {
-        out.push(Req::Close);
-    }
-    out.extend(open);
-    out.extend(render);
-    out
-}
-
-fn pdf_thread(lib: PathBuf, rx: Receiver<Req>, notify: Notify) {
-    // 바인딩 성공 전까지는 요청마다 다시 시도한다 (DLL을 나중에 넣어도 재시작 불필요).
-    while let Ok(first) = rx.recv() {
-        let t = Instant::now();
-        match Pdfium::bind_to_library(&lib) {
-            Ok(bindings) => {
-                let bind_ms = ms(t);
-                let pdfium = Pdfium::new(bindings);
-                serve(&pdfium, first, &rx, &notify, bind_ms);
-                return;
-            }
-            Err(e) => {
-                if let Req::Open { generation, .. } | Req::Render { generation, .. } = first {
-                    notify(PdfEvent::Error {
-                        generation,
-                        message: format!("pdfium.dll 로드 실패 ({}): {e}", lib.display()),
-                    });
-                }
-            }
-        }
-    }
-}
-
-fn serve(pdfium: &Pdfium, first: Req, rx: &Receiver<Req>, notify: &Notify, mut bind_ms: f64) {
-    let mut doc: Option<(Generation, PdfDocument<'_>)> = None;
-    let mut next = Some(first);
-    loop {
-        let req = match next.take() {
-            Some(r) => r,
-            None => match rx.recv() {
-                Ok(r) => r,
-                Err(_) => return,
-            },
-        };
-        for req in coalesce(req, rx) {
-            match req {
-                Req::Close => doc = None,
-                Req::Open { generation, path } => {
-                    doc = None;
-                    let t = Instant::now();
-                    match pdfium.load_pdf_from_file(&path, None) {
-                        Ok(d) => {
-                            let page_count = d.pages().len().max(0) as u32;
-                            let page_size_pt = d
-                                .pages()
-                                .page_size(0)
-                                .map(|r| (r.width().value, r.height().value))
-                                .unwrap_or((612.0, 792.0));
-                            notify(PdfEvent::Opened {
-                                generation,
-                                page_count,
-                                page_size_pt,
-                                bind_ms,
-                                load_ms: ms(t),
-                            });
-                            bind_ms = 0.0;
-                            doc = Some((generation, d));
-                        }
-                        Err(e) => notify(PdfEvent::Error {
-                            generation,
-                            message: format!("PDF를 열 수 없습니다: {e}"),
-                        }),
-                    }
-                }
-                Req::Render {
-                    generation,
-                    page,
-                    target_width_px,
-                } => {
-                    let Some((g, d)) = &doc else { continue };
-                    if *g != generation {
-                        continue;
-                    }
-                    let t = Instant::now();
-                    match render_page(d, page, target_width_px) {
-                        Ok((width, height, stride, bgra)) => notify(PdfEvent::Rendered {
-                            generation,
-                            page,
-                            width,
-                            height,
-                            stride,
-                            bgra,
-                            render_ms: ms(t),
-                        }),
-                        Err(e) => notify(PdfEvent::Error {
-                            generation,
-                            message: format!("{}쪽 렌더 실패: {e}", page + 1),
-                        }),
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn render_page(
-    doc: &PdfDocument<'_>,
-    page: u32,
-    target_width_px: u32,
-) -> Result<(u32, u32, u32, Vec<u8>), PdfiumError> {
-    let p = doc.pages().get(page as PdfPageIndex)?;
-    let cfg = PdfRenderConfig::new()
-        .set_target_width(target_width_px as Pixels)
-        .set_clear_color(PdfColor::WHITE)
-        .render_form_data(true);
-    let bmp = p.render_with_config(&cfg)?;
-    let (w, h) = (bmp.width() as u32, bmp.height() as u32);
-    let bgra = bmp.as_raw_bytes();
-    let stride = if h > 0 {
-        (bgra.len() / h as usize) as u32
-    } else {
-        w * 4
-    };
-    Ok((w, h, stride, bgra))
 }
