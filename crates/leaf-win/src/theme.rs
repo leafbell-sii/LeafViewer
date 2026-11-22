@@ -43,6 +43,8 @@ pub struct Palette {
     pub splitter: u32,
     pub bar_bg: u32,
     pub edit_bg: u32,
+    /// 편집 중 문서 배경 (보기와 구분되는 엷은 노랑, FR-E05)
+    pub editing_bg: u32,
 }
 
 pub const LIGHT: Palette = Palette {
@@ -72,6 +74,7 @@ pub const LIGHT: Palette = Palette {
     splitter: 0xE0E0E0,
     bar_bg: 0xF3F3F3,
     edit_bg: 0xFFFFFF,
+    editing_bg: 0xFFFDF3,
 };
 
 pub const DARK: Palette = Palette {
@@ -101,6 +104,7 @@ pub const DARK: Palette = Palette {
     splitter: 0x333333,
     bar_bg: 0x2B2B2B,
     edit_bg: 0x1F1F1F,
+    editing_bg: 0x26241F,
 };
 
 thread_local! {
