@@ -482,10 +482,18 @@ pub fn run(opts: StartOptions) -> Result<()> {
 
         let hinst: HINSTANCE = GetModuleHandleW(None)?.into();
         let cursor = LoadCursorW(None, IDC_ARROW)?;
+        // 앱 아이콘: leaf-app이 리소스 ID 1로 넣는다. 없으면(테스트 빌드 등) 기본 아이콘
+        let app_icon = |cx, cy| {
+            LoadImageW(Some(hinst), PCWSTR(1 as _), IMAGE_ICON, cx, cy, LR_DEFAULTCOLOR)
+                .map(|h| HICON(h.0))
+                .unwrap_or_default()
+        };
         RegisterClassExW(&WNDCLASSEXW {
             cbSize: size_of::<WNDCLASSEXW>() as u32,
             lpfnWndProc: Some(main_proc),
             hInstance: hinst,
+            hIcon: app_icon(GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON)),
+            hIconSm: app_icon(GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON)),
             hCursor: cursor,
             lpszClassName: MAIN_CLASS,
             ..Default::default()
