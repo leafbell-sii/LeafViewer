@@ -1124,6 +1124,14 @@ impl App {
             }
             return true;
         }
+        // PDF를 보는 중이면 화살표는 어디에 포커스가 있든 쪽 넘기기
+        if !ctrl
+            && matches!(vk, VK_LEFT | VK_RIGHT | VK_UP | VK_DOWN)
+            && matches!(self.view.borrow().content, Content::Pdf(_))
+        {
+            self.on_doc_key(vk);
+            return true;
+        }
         match vk {
             _ if ctrl && vk.0 == b'O' as u16 => unsafe {
                 let _ = PostMessageW(

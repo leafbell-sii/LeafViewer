@@ -22,7 +22,6 @@ use crate::render::{self, Target, rgb};
 /// 쪽 텍스트·링크 캐시 크기(쪽 수)
 const TEXT_CACHE_PAGES: usize = 64;
 
-const LINE_STEP: f32 = 40.0;
 const CLICK_SLOP: f32 = 4.0;
 
 pub enum Cmd {
@@ -283,10 +282,9 @@ impl PdfView {
         let page = self.current_page();
         let last = self.page_count().saturating_sub(1);
         match VIRTUAL_KEY(vk) {
-            VK_DOWN => self.scroll_by(0.0, LINE_STEP),
-            VK_UP => self.scroll_by(0.0, -LINE_STEP),
-            VK_RIGHT => self.scroll_by(LINE_STEP, 0.0),
-            VK_LEFT => self.scroll_by(-LINE_STEP, 0.0),
+            // 화살표: 쪽 넘기기. 포커스와 상관없이 App::accelerator가 이리로 보낸다
+            VK_RIGHT | VK_DOWN => self.go_page((page + 1).min(last)),
+            VK_LEFT | VK_UP => self.go_page(page.saturating_sub(1)),
             // FR-P03: PgUp/PgDn = 이전/다음 쪽
             VK_NEXT => self.go_page((page + 1).min(last)),
             VK_PRIOR => {
