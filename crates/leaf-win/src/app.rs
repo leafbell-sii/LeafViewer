@@ -2060,6 +2060,7 @@ impl App {
             }
             ListEvent::Toggle(k, e) if k >= 0 => self.toggle_node(k as usize, e),
             ListEvent::Menu(k, pt) if k >= 0 => self.file_menu(k as usize, pt),
+            ListEvent::Delete(k) if k > 0 => self.delete_node(k as usize, shift_down()),
             // 빈 곳: 루트 폴더 메뉴
             ListEvent::Menu(_, pt) if self.model.borrow().root().is_some() => self.file_menu(0, pt),
             _ => {}
@@ -2078,6 +2079,7 @@ impl App {
         const NEW_FILE: usize = 8;
         const NEW_DIR: usize = 9;
         const EDIT_HERE: usize = 10;
+        const DELETE: usize = 11;
         let Some((path, is_dir)) = self
             .model
             .borrow()
@@ -2100,6 +2102,10 @@ impl App {
             }
             add(NEW_FILE, "새 파일", MF_ENABLED);
             add(NEW_DIR, "새 폴더", MF_ENABLED);
+            // 루트 폴더는 지우지 않는다
+            if idx != 0 {
+                add(DELETE, "삭제\tDel", MF_ENABLED);
+            }
             let _ = AppendMenuW(m, MF_SEPARATOR, 0, None);
             add(REVEAL, "탐색기에서 보기", MF_ENABLED);
             add(COPY, "경로 복사", MF_ENABLED);
@@ -2147,6 +2153,7 @@ impl App {
                 self.start_edit(&path);
             }
             NEW_FILE => self.begin_naming(idx, false, ""),
+            DELETE => self.delete_node(idx, shift_down()),
             NEW_DIR => self.begin_naming(idx, true, ""),
             REVEAL => reveal_in_explorer(self.hwnd, &path),
             COPY => {
@@ -2361,6 +2368,114 @@ impl App {
             }
             self.open_file(path.clone(), OpenKind::Navigate);
             self.start_edit(&path);
+        }
+    }
+
+    // ───── 삭제 (FR-F16) ─────
+
+    /// 트리 항목 삭제. 기본은 휴지통, `permanent`(Shift)면 영구 삭제. 항상 확인한다
+    fn delete_node(&self, idx: usize, permanent: bool) {
+        let Some((path, is_dir, parent)) = self
+            .model
+            .borrow()
+            .get(idx)
+            .filter(|_| idx != 0)
+            .map(|n| (n.path.clone(), n.is_dir, n.parent))
+        else {
+            return;
+        };
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let what = if is_dir {
+            let count = std::fs::read_dir(&path).map_or(0, |d| d.count());
+            if count > 0 {
+                format!("'{name}' 폴더와 안의 항목 {count}개")
+            } else {
+                format!("'{name}' 폴더")
+            }
+        } else {
+            format!("'{name}'")
+        };
+        let editing = self
+            .editor
+            .borrow()
+            .as_ref()
+            .filter(|e| e.path.starts_with(&path))
+            .map(|e| e.is_modified());
+        let mut text = if permanent {
+            format!("{what}을(를) 영구 삭제할까요?\n되돌릴 수 없습니다.")
+        } else {
+            format!("{what}을(를) 휴지통으로 보낼까요?")
+        };
+        if editing == Some(true) {
+            text.push_str("\n\n편집 중인 내용은 저장하지 않습니다.");
+        }
+        let flags = MB_YESNO
+            | MB_DEFBUTTON2
+            | if permanent {
+                MB_ICONWARNING
+            } else {
+                MB_ICONQUESTION
+            };
+        if self.ask(&text, flags) != Some(IDYES) {
+            return;
+        }
+        // 지울 파일을 붙잡지 않도록: 편집기는 버리고, 보고 있는 문서는 닫는다(매핑·PDF 핸들)
+        if editing.is_some() {
+            let ed = self.editor.borrow_mut().take();
+            drop(ed);
+            self.layout();
+        }
+        if self.current_path().is_some_and(|p| p.starts_with(&path)) {
+            self.remember_current();
+            self.set_content(Content::Message(format!(
+                "삭제한 파일입니다.\n\n{}",
+                path.display()
+            )));
+            self.view.borrow_mut().info.clear();
+        }
+        // 목록 끝은 NUL 두 개
+        let mut from = wide(&path);
+        from.push(0);
+        let mut op = SHFILEOPSTRUCTW {
+            hwnd: self.hwnd,
+            wFunc: FO_DELETE,
+            pFrom: PCWSTR(from.as_ptr()),
+            fFlags: (FOF_NOCONFIRMATION.0
+                | FOF_SILENT.0
+                | FOF_NOERRORUI.0
+                | if permanent {
+                    0
+                } else {
+                    // 휴지통에 못 넣는 곳(네트워크 드라이브 등)이면 영구 삭제 전에 경고
+                    FOF_ALLOWUNDO.0 | FOF_WANTNUKEWARNING.0
+                }) as u16,
+            ..Default::default()
+        };
+        let r = unsafe { SHFileOperationW(&mut op) };
+        if r != 0 || op.fAnyOperationsAborted.as_bool() || path.exists() {
+            self.set_status(1, &format!("삭제하지 못했습니다: {name} (코드 {r:#x})"));
+        } else {
+            self.set_status(
+                1,
+                &format!(
+                    "{}: {name}",
+                    if permanent {
+                        "영구 삭제함"
+                    } else {
+                        "휴지통으로 보냄"
+                    }
+                ),
+            );
+        }
+        if let Some(p) = parent {
+            self.files
+                .st
+                .borrow_mut()
+                .select_key(Some(p as isize), true);
+            self.list_dir(p);
         }
     }
 
@@ -4459,12 +4574,12 @@ extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
                 LRESULT(1)
             }
             WM_CTLCOLOREDIT => {
-                // 편집기: 문서 배경·글자색
+                // 편집기: 보기와 구분되는 엷은 배경 (FR-E05)
                 let hdc = HDC(wparam.0 as *mut c_void);
                 let p = theme::current();
                 SetTextColor(hdc, theme::colorref(p.text));
-                SetBkColor(hdc, theme::colorref(p.bg));
-                LRESULT(theme::brush(p.bg).0 as isize)
+                SetBkColor(hdc, theme::colorref(p.editing_bg));
+                LRESULT(theme::brush(p.editing_bg).0 as isize)
             }
             WM_COMMAND if hiword(wparam.0) == EN_CHANGE && lparam.0 != 0 => {
                 app.on_editor_change();

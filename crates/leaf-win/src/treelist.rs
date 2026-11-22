@@ -46,6 +46,8 @@ pub enum ListEvent {
     Toggle(isize, bool),
     /// 우클릭·메뉴 키 (화면 좌표)
     Menu(isize, POINT),
+    /// Delete 키 (Shift 여부는 앱이 본다)
+    Delete(isize),
 }
 
 const ROW_DIP: i32 = 24;
@@ -513,6 +515,13 @@ impl ListState {
             VK_RETURN => {
                 if let Some(c) = cur {
                     out.push(ListEvent::Activate(self.rows[c].key));
+                }
+            }
+            VK_DELETE => {
+                if let Some(c) = cur
+                    && self.rows[c].key >= 0
+                {
+                    out.push(ListEvent::Delete(self.rows[c].key));
                 }
             }
             _ => {}
