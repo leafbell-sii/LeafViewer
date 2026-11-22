@@ -1,4 +1,4 @@
-﻿[package]
+[package]
 name = "leaf-app"
 description = "LeafViewer 실행 파일: 조립, 명령줄"
 version.workspace = true
@@ -12,3 +12,6 @@ path = "src/main.rs"
 
 [dependencies]
 leaf-win.workspace = true
+
+[build-dependencies]
+embed-resource = "3.0.12"
