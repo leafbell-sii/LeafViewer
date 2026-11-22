@@ -161,6 +161,36 @@ impl ListState {
         self.invalidate();
     }
 
+    /// 그 key 행의 이름 칸(아이콘 오른쪽) 영역. 화면 밖이면 위·아래로 벗어난 좌표가 나온다
+    pub fn text_rect(&self, key: isize) -> Option<RECT> {
+        let i = self.index_of(key)?;
+        let r = &self.rows[i];
+        let mut x = self.chevron_x(r).1;
+        if r.icon != Icon::None {
+            x += scale(20, self.dpi);
+        }
+        let mut rc = RECT::default();
+        unsafe {
+            let _ = GetClientRect(self.hwnd, &mut rc);
+        }
+        let rh = self.row_h();
+        let y = (i as isize - self.top as isize) as i32 * rh;
+        Some(RECT {
+            left: x - scale(2, self.dpi),
+            top: y + 1,
+            right: rc.right - scale(4, self.dpi),
+            bottom: y + rh - 1,
+        })
+    }
+
+    /// 그 key 행이 보이도록 스크롤한다
+    pub fn ensure_key_visible(&mut self, key: isize) {
+        if let Some(i) = self.index_of(key) {
+            self.ensure_visible(i);
+            self.invalidate();
+        }
+    }
+
     fn ensure_visible(&mut self, i: usize) {
         let page = self.page_rows();
         if i < self.top {
@@ -348,14 +378,18 @@ impl ListState {
                 Some(LRESULT(0))
             }
             WM_RBUTTONUP => {
-                if let Some(i) = self.row_at(y)
-                    && self.rows[i].key >= 0
-                {
+                // 행이 없는 빈 곳은 key -1 (파일 트리는 루트 폴더 메뉴로 쓴다)
+                let key = match self.row_at(y) {
+                    Some(i) if self.rows[i].key >= 0 => Some(self.rows[i].key),
+                    Some(_) => None,
+                    None => Some(-1),
+                };
+                if let Some(key) = key {
                     let mut pt = POINT { x, y };
                     unsafe {
                         let _ = ClientToScreen(self.hwnd, &mut pt);
                     }
-                    out.push(ListEvent::Menu(self.rows[i].key, pt));
+                    out.push(ListEvent::Menu(key, pt));
                 }
                 Some(LRESULT(0))
             }
