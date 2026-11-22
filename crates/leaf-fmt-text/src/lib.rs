@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 pub mod doc;
+pub mod edit;
 pub mod encoding;
 pub mod index;
 pub mod search;

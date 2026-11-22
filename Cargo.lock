@@ -375,6 +375,7 @@ name = "leaf-win"
 version = "1.0.0"
 dependencies = [
  "crossbeam-channel",
+ "encoding_rs",
  "leaf-core",
  "leaf-doc",
  "leaf-fmt-image",

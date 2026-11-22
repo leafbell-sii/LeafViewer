@@ -38,7 +38,7 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
 use windows::Win32::System::Ole::CF_UNICODETEXT;
 use windows::Win32::System::Threading::CreateMutexW;
-use windows::Win32::UI::Controls::SetScrollInfo;
+use windows::Win32::UI::Controls::{EM_SETSEL, SetScrollInfo, WC_EDITW};
 use windows::Win32::UI::HiDpi::{GetDpiForWindow, SystemParametersInfoForDpi};
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::Shell::*;
@@ -49,6 +49,7 @@ use crate::StartOptions;
 use crate::bar::{BAR_HEIGHT_DIP, Bar, BarEvent, BarMode, WM_APP_BAR};
 use crate::chrome::{self, Strip, StripKind, WM_APP_TAB};
 use crate::custom::{CustomCmd, CustomView, OpenCtx};
+use crate::editor::{self, Editor, SaveError};
 use crate::formats;
 use crate::mdload::{self, DecodedImage, LoadedMd};
 use crate::mdview::{MdCmd, MdStyle, MdView};
@@ -66,6 +67,10 @@ const DOC_CLASS: PCWSTR = w!("LeafViewer.Doc");
 const WM_APP_WAKE: u32 = WM_APP + 1;
 /// 창 프로시저에서 잡은 패닉을 복구한다
 const WM_APP_PANIC: u32 = WM_APP + 4;
+/// 새 이름 입력칸이 포커스를 잃음 → 확정 (wparam = 입력칸 HWND)
+const WM_APP_NAMING: u32 = WM_APP + 5;
+/// 트리에 끼워 넣는 새 이름 입력 행의 key
+const NAMING_KEY: isize = -2;
 const ID_OPEN_FOLDER: usize = 200;
 const TIMER_SELECT: usize = 1;
 const TIMER_FIND: usize = 2;
@@ -327,6 +332,14 @@ struct List {
     st: RefCell<ListState>,
 }
 
+/// 트리에서 새 파일·폴더 이름을 입력하는 중 (입력칸은 파일 트리 목록의 자식 EDIT)
+struct Naming {
+    /// 만들 위치(폴더)의 모델 번호
+    parent: usize,
+    dir: bool,
+    edit: HWND,
+}
+
 /// 목차 (FR-P07, FR-M07): 평탄화한 항목과 펼침 상태
 #[derive(Default)]
 struct Outline {
@@ -389,6 +402,11 @@ struct App {
     /// 사이드바 폭을 끄는 중: 누른 지점과 사이드바 오른쪽 끝의 차이(px)
     split_drag: Cell<Option<i32>>,
     bench: RefCell<Option<Bench>>,
+    /// TXT·MD 편집 중이면 EDIT 컨트롤 (문서 영역을 덮는다)
+    editor: RefCell<Option<Editor>>,
+    naming: RefCell<Option<Naming>>,
+    /// 저장 확인 등 메시지 상자를 띄운 중 (그 사이 다시 묻지 않는다)
+    modal: Cell<bool>,
 }
 
 fn app_of<'a>(hwnd: HWND) -> Option<&'a App> {
@@ -484,9 +502,16 @@ pub fn run(opts: StartOptions) -> Result<()> {
         let cursor = LoadCursorW(None, IDC_ARROW)?;
         // 앱 아이콘: leaf-app이 리소스 ID 1로 넣는다. 없으면(테스트 빌드 등) 기본 아이콘
         let app_icon = |cx, cy| {
-            LoadImageW(Some(hinst), PCWSTR(1 as _), IMAGE_ICON, cx, cy, LR_DEFAULTCOLOR)
-                .map(|h| HICON(h.0))
-                .unwrap_or_default()
+            LoadImageW(
+                Some(hinst),
+                PCWSTR(1 as _),
+                IMAGE_ICON,
+                cx,
+                cy,
+                LR_DEFAULTCOLOR,
+            )
+            .map(|h| HICON(h.0))
+            .unwrap_or_default()
         };
         RegisterClassExW(&WNDCLASSEXW {
             cbSize: size_of::<WNDCLASSEXW>() as u32,
@@ -546,7 +571,7 @@ pub fn run(opts: StartOptions) -> Result<()> {
         let tabs = Strip::create(hwnd, hinst, StripKind::Tabs, &["파일", "목차"])?;
         let files = create_child(
             treelist::LIST_CLASS,
-            WS_VISIBLE | WS_VSCROLL | WS_TABSTOP,
+            WS_VISIBLE | WS_VSCROLL | WS_TABSTOP | WS_CLIPCHILDREN,
             hwnd,
             hinst,
         )?;
@@ -638,6 +663,9 @@ pub fn run(opts: StartOptions) -> Result<()> {
             history: RefCell::new(History::default()),
             split_drag: Cell::new(None),
             bench: RefCell::new(opts.bench_scroll.then(Bench::default)),
+            editor: RefCell::new(None),
+            naming: RefCell::new(None),
+            modal: Cell::new(false),
         });
         let app_ptr = Box::into_raw(app);
         for h in [hwnd, doc, files, outline] {
@@ -788,6 +816,34 @@ fn is_viewer_ext(p: &Path) -> bool {
 }
 
 /// `"C:\…\code.exe" --flag 파일` → (실행 파일, 나머지 인자)
+/// 새 파일·폴더 이름 검사 (Windows 규칙)
+fn validate_name(s: &str) -> std::result::Result<(), &'static str> {
+    if s == "." || s == ".." {
+        return Err("쓸 수 없는 이름입니다");
+    }
+    if s.chars().any(|c| c < ' ' || "<>:\"/\\|?*".contains(c)) {
+        return Err("이름에 \\ / : * ? \" < > | 를 쓸 수 없습니다");
+    }
+    if s.ends_with('.') {
+        return Err("이름은 마침표로 끝날 수 없습니다");
+    }
+    let stem = s
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .trim_end()
+        .to_ascii_uppercase();
+    let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (stem.len() == 4
+            && (stem.starts_with("COM") || stem.starts_with("LPT"))
+            && stem.as_bytes()[3].is_ascii_digit()
+            && stem.as_bytes()[3] != b'0');
+    if reserved {
+        return Err("Windows 예약 이름이라 쓸 수 없습니다");
+    }
+    Ok(())
+}
+
 fn split_command(line: &str) -> (String, String) {
     let line = line.trim();
     if let Some(rest) = line.strip_prefix('"')
@@ -890,6 +946,12 @@ impl App {
             theme::apply_scrollbar_theme(h, dark);
         }
         self.bar.apply_theme(dark);
+        if let Some(e) = self.editor.borrow().as_ref() {
+            e.apply_theme(dark);
+        }
+        if let Some(n) = self.naming.borrow().as_ref() {
+            theme::apply_edit_theme(n.edit, dark);
+        }
         self.view.borrow_mut().renderer.discard_target();
         self.scroll_cache.set(None);
         unsafe {
@@ -926,6 +988,11 @@ impl App {
         {
             self.show_all.set(new.general.show_all_files);
             self.relist_all();
+        }
+        if old.text != new.text
+            && let Some(e) = self.editor.borrow().as_ref()
+        {
+            e.set_font(&new.text, self.dpi());
         }
         if old.text != new.text
             || old.markdown != new.markdown
@@ -1044,6 +1111,18 @@ impl App {
             let _ = MoveWindow(self.bar.hwnd, x, 0, doc_w, bar_h, true);
             self.bar.layout(doc_w, dpi);
             let _ = MoveWindow(self.doc, x, bar_h, doc_w, (h - bar_h).max(0), true);
+            // 편집 중이면 EDIT 컨트롤이 문서 영역을 대신한다
+            let ed = self.editor.borrow().as_ref().map(|e| e.hwnd);
+            match ed {
+                Some(e) => {
+                    let _ = MoveWindow(e, x, bar_h, doc_w, (h - bar_h).max(0), true);
+                    let _ = ShowWindow(e, SW_SHOW);
+                    let _ = ShowWindow(self.doc, SW_HIDE);
+                }
+                None => {
+                    let _ = ShowWindow(self.doc, SW_SHOW);
+                }
+            }
             let _ = InvalidateRect(Some(self.hwnd), None, true);
         }
     }
@@ -1068,11 +1147,16 @@ impl App {
         self.layout();
         unsafe {
             let _ = SetFocus(Some(if hidden {
-                self.doc
+                self.doc_focus()
             } else {
                 self.current_list().hwnd
             }));
         }
+    }
+
+    /// 문서 영역에서 포커스를 받을 창 (편집 중이면 EDIT)
+    fn doc_focus(&self) -> HWND {
+        self.editor.borrow().as_ref().map_or(self.doc, |e| e.hwnd)
     }
 
     fn current_list(&self) -> &List {
@@ -1105,6 +1189,46 @@ impl App {
     fn accelerator(&self, vk: u16, alt: bool) -> bool {
         let ctrl = ctrl_down();
         let vk = VIRTUAL_KEY(vk);
+        let focus = unsafe { GetFocus() };
+        // 트리의 새 이름 입력칸: Enter 확정, Esc 취소. 나머지 키는 입력칸이 받는다
+        let naming = self.naming.borrow().as_ref().map(|n| n.edit);
+        if naming == Some(focus) {
+            match vk {
+                VK_RETURN if !alt => self.finish_naming(true, true),
+                VK_ESCAPE if !alt => self.finish_naming(false, false),
+                _ => return false,
+            }
+            return true;
+        }
+        // 편집 중: Ctrl+S 저장 · Ctrl+E/Esc 끝내기 · Ctrl+A 전체 선택. 그 밖의 키는 EDIT가 받는다
+        let ed = self.editor.borrow().as_ref().map(|e| e.hwnd);
+        if let Some(ed) = ed {
+            let in_editor = focus == ed;
+            if !alt && ctrl && vk.0 == b'S' as u16 {
+                self.save_edit();
+                return true;
+            }
+            if !alt && ctrl && !shift_down() && vk.0 == b'E' as u16 {
+                self.end_edit();
+                return true;
+            }
+            if in_editor {
+                match vk {
+                    _ if alt => return false,
+                    _ if ctrl && vk.0 == b'A' as u16 => {
+                        if let Some(e) = self.editor.borrow().as_ref() {
+                            e.select_all();
+                        }
+                    }
+                    _ if ctrl && vk.0 == b'B' as u16 => self.toggle_sidebar(),
+                    VK_ESCAPE => {
+                        self.end_edit();
+                    }
+                    _ => return false,
+                }
+                return true;
+            }
+        }
         if alt {
             match vk {
                 // Alt+←/→: 뒤로/앞으로 (FR-V02)
@@ -1156,6 +1280,11 @@ impl App {
                 Some(p) => self.edit_externally(&p),
                 None => return false,
             },
+            // Ctrl+E: 지금 문서(TXT·MD) 편집
+            _ if ctrl && vk.0 == b'E' as u16 => match self.current_path() {
+                Some(p) if editor::is_editable(&p) => self.start_edit(&p),
+                _ => return false,
+            },
             VK_OEM_COMMA if ctrl => self.open_config(),
             VK_F5 => {
                 self.relist_all();
@@ -1176,6 +1305,9 @@ impl App {
     // ───── 찾기 / 쪽·줄 이동 막대 ─────
 
     fn show_bar(&self, mode: BarMode) {
+        if self.editor.borrow().is_some() {
+            return;
+        }
         let ok = match self.view.borrow().content {
             Content::Pdf(_) | Content::Text(_) => true,
             // MD에는 쪽·줄 번호가 없다
@@ -1640,6 +1772,7 @@ impl App {
     }
 
     fn set_root(&self, root: &Path) {
+        self.finish_naming(false, false);
         self.model.borrow_mut().set_root(root);
         *self.pending_reveal.borrow_mut() = None;
         self.files.st.borrow_mut().select_key(None, false);
@@ -1791,9 +1924,30 @@ impl App {
                         }
                     }
                 })
-                .collect()
+                .collect::<Vec<Row>>()
         };
+        let mut rows = rows;
+        // 새 이름 입력 행: 만들 폴더 바로 아래 첫 줄
+        let naming = self.naming.borrow().as_ref().map(|n| (n.parent, n.dir));
+        if let Some((parent, dir)) = naming
+            && let Some(p) = rows.iter().position(|r| r.key == parent as isize)
+        {
+            let depth = rows[p].depth + 1;
+            rows.insert(
+                p + 1,
+                Row {
+                    key: NAMING_KEY,
+                    depth,
+                    text: Vec::new(),
+                    icon: if dir { Icon::Folder } else { Icon::File },
+                    expandable: false,
+                    expanded: false,
+                    dim: false,
+                },
+            );
+        }
         self.files.st.borrow_mut().set_rows(rows);
+        self.place_naming_edit();
     }
 
     /// 트리에서 그 파일을 찾아 선택한다(접힌 폴더는 펼치며 찾아간다). 문서는 열지 않는다.
@@ -1906,6 +2060,8 @@ impl App {
             }
             ListEvent::Toggle(k, e) if k >= 0 => self.toggle_node(k as usize, e),
             ListEvent::Menu(k, pt) if k >= 0 => self.file_menu(k as usize, pt),
+            // 빈 곳: 루트 폴더 메뉴
+            ListEvent::Menu(_, pt) if self.model.borrow().root().is_some() => self.file_menu(0, pt),
             _ => {}
         }
     }
@@ -1919,6 +2075,9 @@ impl App {
         const EDIT: usize = 5;
         const SHOW_ALL: usize = 6;
         const REFRESH: usize = 7;
+        const NEW_FILE: usize = 8;
+        const NEW_DIR: usize = 9;
+        const EDIT_HERE: usize = 10;
         let Some((path, is_dir)) = self
             .model
             .borrow()
@@ -1935,7 +2094,13 @@ impl App {
             };
             if !is_dir {
                 add(OPEN, "열기\tEnter", MF_ENABLED);
+                if editor::is_editable(&path) {
+                    add(EDIT_HERE, "편집\tCtrl+E", MF_ENABLED);
+                }
             }
+            add(NEW_FILE, "새 파일", MF_ENABLED);
+            add(NEW_DIR, "새 폴더", MF_ENABLED);
+            let _ = AppendMenuW(m, MF_SEPARATOR, 0, None);
             add(REVEAL, "탐색기에서 보기", MF_ENABLED);
             add(COPY, "경로 복사", MF_ENABLED);
             if !is_dir {
@@ -1967,6 +2132,22 @@ impl App {
         };
         match cmd {
             OPEN => self.open_node(idx),
+            EDIT_HERE => {
+                let other = self
+                    .editor
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|e| !same_path(&e.path, &path));
+                if other && !self.end_edit() {
+                    return;
+                }
+                if !self.current_path().is_some_and(|p| same_path(&p, &path)) {
+                    self.open_node(idx);
+                }
+                self.start_edit(&path);
+            }
+            NEW_FILE => self.begin_naming(idx, false, ""),
+            NEW_DIR => self.begin_naming(idx, true, ""),
             REVEAL => reveal_in_explorer(self.hwnd, &path),
             COPY => {
                 let s = path.display().to_string();
@@ -2001,6 +2182,373 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    // ───── 새 파일 / 새 폴더 (트리 행에서 이름 입력) ─────
+
+    /// `idx`가 폴더면 그 안에, 파일이면 같은 폴더에 만든다. `initial`: 입력칸에 미리 넣을 이름
+    fn begin_naming(&self, idx: usize, dir: bool, initial: &str) {
+        self.finish_naming(false, false);
+        let parent = {
+            let m = self.model.borrow();
+            match m.get(idx) {
+                Some(n) if n.is_dir => idx,
+                Some(n) => match n.parent {
+                    Some(p) => p,
+                    None => return,
+                },
+                None => return,
+            }
+        };
+        if !self.model.borrow().nodes[parent].expanded {
+            self.toggle_node(parent, true);
+        }
+        let edit = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                WC_EDITW,
+                None,
+                WS_CHILD | WS_BORDER | WINDOW_STYLE(ES_AUTOHSCROLL as u32),
+                0,
+                0,
+                0,
+                0,
+                Some(self.files.hwnd),
+                None,
+                None,
+                None,
+            )
+        };
+        let Ok(edit) = edit else { return };
+        unsafe {
+            let font = self.fonts.borrow().text;
+            SendMessageW(
+                edit,
+                WM_SETFONT,
+                Some(WPARAM(font.0 as usize)),
+                Some(LPARAM(0)),
+            );
+            theme::apply_edit_theme(edit, theme::current().dark);
+            let t = wide(initial);
+            let _ = SetWindowTextW(edit, PCWSTR(t.as_ptr()));
+            SendMessageW(edit, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1)));
+        }
+        *self.naming.borrow_mut() = Some(Naming { parent, dir, edit });
+        self.rebuild_file_rows();
+        self.files.st.borrow_mut().ensure_key_visible(NAMING_KEY);
+        self.place_naming_edit();
+        unsafe {
+            let _ = SetFocus(Some(edit));
+        }
+    }
+
+    /// 입력칸을 입력 행 위치에 맞춘다 (행 목록이 바뀌거나 스크롤할 때마다)
+    fn place_naming_edit(&self) {
+        let Some(edit) = self.naming.borrow().as_ref().map(|n| n.edit) else {
+            return;
+        };
+        let rc = self
+            .files
+            .st
+            .try_borrow()
+            .ok()
+            .and_then(|st| st.text_rect(NAMING_KEY));
+        unsafe {
+            match rc {
+                Some(rc) => {
+                    let _ = MoveWindow(
+                        edit,
+                        rc.left,
+                        rc.top,
+                        (rc.right - rc.left).max(20),
+                        rc.bottom - rc.top,
+                        true,
+                    );
+                    let _ = ShowWindow(edit, SW_SHOW);
+                }
+                None => {
+                    let _ = ShowWindow(edit, SW_HIDE);
+                }
+            }
+        }
+    }
+
+    /// 이름 입력 끝. `commit`이면 만든다. `retry`(Enter로 확정)면 잘못된 이름일 때 다시 입력받는다
+    fn finish_naming(&self, commit: bool, retry: bool) {
+        let Some(n) = self.naming.borrow_mut().take() else {
+            return;
+        };
+        let text = if commit {
+            unsafe {
+                let len = GetWindowTextLengthW(n.edit).max(0) as usize;
+                let mut buf = vec![0u16; len + 1];
+                let got = GetWindowTextW(n.edit, &mut buf).max(0) as usize;
+                String::from_utf16_lossy(&buf[..got.min(len)])
+            }
+        } else {
+            String::new()
+        };
+        let had_focus = unsafe { GetFocus() } == n.edit;
+        unsafe {
+            // 파괴하며 오는 EN_KILLFOCUS는 naming이 이미 비어 있어 무시된다
+            let _ = DestroyWindow(n.edit);
+        }
+        self.rebuild_file_rows();
+        if had_focus {
+            unsafe {
+                let _ = SetFocus(Some(self.files.hwnd));
+            }
+        }
+        let name = text.trim();
+        if name.is_empty() {
+            return;
+        }
+        let fail = |why: &str| {
+            self.set_status(1, why);
+            if retry {
+                self.begin_naming(n.parent, n.dir, name);
+            }
+        };
+        if let Err(why) = validate_name(name) {
+            fail(why);
+            return;
+        }
+        let Some(dir_path) = self.model.borrow().get(n.parent).map(|p| p.path.clone()) else {
+            return;
+        };
+        let mut file_name = name.to_owned();
+        // 확장자를 안 쓰면 텍스트 파일
+        if !n.dir && Path::new(name).extension().is_none() {
+            file_name.push_str(".txt");
+        }
+        let path = dir_path.join(&file_name);
+        let r = if n.dir {
+            std::fs::create_dir(&path)
+        } else {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .map(drop)
+        };
+        if let Err(e) = r {
+            fail(&if e.kind() == std::io::ErrorKind::AlreadyExists {
+                format!("같은 이름이 이미 있습니다: {file_name}")
+            } else {
+                format!("만들 수 없습니다: {e}")
+            });
+            return;
+        }
+        let hidden = !n.dir
+            && !self.show_all.get()
+            && leaf_core::format::registry().by_path(&path).is_none();
+        self.set_status(
+            1,
+            &if hidden {
+                format!(
+                    "만듦: {file_name} (지원 형식이 아니라 트리에 보이지 않음 — '모든 파일 표시')"
+                )
+            } else {
+                format!("만듦: {file_name}")
+            },
+        );
+        // 폴더를 다시 읽은 뒤 새 항목을 선택한다
+        *self.pending_reveal.borrow_mut() = Some(path.clone());
+        self.list_dir(n.parent);
+        if !n.dir && editor::is_editable(&path) {
+            if !self.end_edit() {
+                return;
+            }
+            self.open_file(path.clone(), OpenKind::Navigate);
+            self.start_edit(&path);
+        }
+    }
+
+    // ───── TXT·MD 편집 ─────
+
+    /// 메시지 상자. 띄운 동안 다른 확인 요청은 취소로 본다
+    fn ask(&self, text: &str, flags: MESSAGEBOX_STYLE) -> Option<MESSAGEBOX_RESULT> {
+        if self.modal.replace(true) {
+            return None;
+        }
+        let t = wide(text);
+        let r =
+            unsafe { MessageBoxW(Some(self.hwnd), PCWSTR(t.as_ptr()), w!("LeafViewer"), flags) };
+        self.modal.set(false);
+        Some(r)
+    }
+
+    fn start_edit(&self, path: &Path) {
+        let cur = self.editor.borrow().as_ref().map(|e| e.path.clone());
+        if let Some(cur) = cur {
+            if same_path(&cur, path) {
+                unsafe {
+                    let _ = SetFocus(Some(self.doc_focus()));
+                }
+                return;
+            }
+            if !self.end_edit() {
+                return;
+            }
+        }
+        if !editor::is_editable(path) {
+            self.set_status(1, "TXT·MD 파일만 편집할 수 있습니다");
+            return;
+        }
+        let cfg = self.config.borrow().text.clone();
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let r = Editor::open(self.hwnd, path, &cfg, self.dpi(), || {
+            self.ask(
+                &format!(
+                    "'{name}'에 인코딩을 해석할 수 없는 바이트가 있습니다.\n\
+                     편집해 저장하면 그 부분이 대체 문자(�)로 바뀝니다. 계속할까요?"
+                ),
+                MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2,
+            ) == Some(IDYES)
+        });
+        let ed = match r {
+            Ok(ed) => ed,
+            Err(e) => {
+                self.set_status(1, &format!("편집할 수 없습니다: {e}"));
+                return;
+            }
+        };
+        ed.apply_theme(theme::current().dark);
+        let hwnd = ed.hwnd;
+        *self.editor.borrow_mut() = Some(ed);
+        self.hide_bar();
+        self.layout();
+        unsafe {
+            let _ = SetFocus(Some(hwnd));
+        }
+        self.update_edit_status();
+    }
+
+    fn update_edit_status(&self) {
+        let s = self.editor.borrow().as_ref().map(|e| {
+            format!(
+                "편집 중{} — {} · {} · Ctrl+S 저장 · Esc 끝내기",
+                if e.shown_dirty.get() { " ●" } else { "" },
+                e.file_name(),
+                e.encoding_label()
+            )
+        });
+        if let Some(s) = s {
+            self.set_status(0, &s);
+        }
+    }
+
+    /// EN_CHANGE: 수정 표시(●)가 바뀔 때만 상태 표시줄을 고친다
+    fn on_editor_change(&self) {
+        let changed = match self.editor.try_borrow() {
+            Ok(e) => e.as_ref().is_some_and(|e| {
+                let d = e.is_modified();
+                e.shown_dirty.replace(d) != d
+            }),
+            Err(_) => false,
+        };
+        if changed {
+            self.update_edit_status();
+        }
+    }
+
+    /// Ctrl+S. 실패하거나 취소하면 false
+    fn save_edit(&self) -> bool {
+        let r = match self.editor.borrow().as_ref() {
+            Some(e) => e.save(false),
+            None => return true,
+        };
+        let r = match r {
+            Err(SaveError::Unmappable) => {
+                let (name, label) = match self.editor.borrow().as_ref() {
+                    Some(e) => (e.file_name(), e.encoding_label()),
+                    None => return false,
+                };
+                let ok = self.ask(
+                    &format!(
+                        "'{name}'에 원래 인코딩({label})으로 저장할 수 없는 글자가 있습니다.\n\
+                         UTF-8로 바꿔 저장할까요?"
+                    ),
+                    MB_YESNO | MB_ICONWARNING,
+                ) == Some(IDYES);
+                if !ok {
+                    return false;
+                }
+                match self.editor.borrow().as_ref() {
+                    Some(e) => e.save(true),
+                    None => return false,
+                }
+            }
+            r => r,
+        };
+        match r {
+            Ok(()) => {
+                if let Some(e) = self.editor.borrow().as_ref() {
+                    e.shown_dirty.set(false);
+                }
+                self.update_edit_status();
+                self.set_status(1, "저장했습니다");
+                true
+            }
+            Err(SaveError::Io(e)) => {
+                self.ask(
+                    &format!("저장하지 못했습니다.\n\n{e}"),
+                    MB_OK | MB_ICONERROR,
+                );
+                false
+            }
+            Err(SaveError::Unmappable) => false,
+        }
+    }
+
+    /// 편집 끝내기. 수정했으면 저장할지 묻는다. 취소하면 false (편집을 이어 간다)
+    fn end_edit(&self) -> bool {
+        let info = self
+            .editor
+            .borrow()
+            .as_ref()
+            .map(|e| (e.is_modified(), e.file_name()));
+        let Some((dirty, name)) = info else {
+            return true;
+        };
+        if dirty {
+            match self.ask(
+                &format!("'{name}'의 변경 내용을 저장할까요?"),
+                MB_YESNOCANCEL | MB_ICONQUESTION,
+            ) {
+                Some(IDYES) => {
+                    if !self.save_edit() {
+                        return false;
+                    }
+                }
+                Some(IDNO) => {}
+                _ => return false,
+            }
+        }
+        let Some(ed) = self.editor.borrow_mut().take() else {
+            return true;
+        };
+        let had_focus = unsafe { GetFocus() } == ed.hwnd;
+        let (path, saved) = (ed.path.clone(), ed.saved.get());
+        drop(ed);
+        self.layout();
+        if had_focus {
+            unsafe {
+                let _ = SetFocus(Some(self.doc));
+            }
+        }
+        // 저장했으면 감시 이벤트를 기다리지 않고 보기를 새로 읽는다
+        let showing = self.current_path().is_some_and(|p| same_path(&p, &path));
+        if showing && saved && self.doc_changed_on_disk() {
+            self.reload_doc();
+        } else {
+            let info = self.view.borrow().info.clone();
+            self.set_status(0, &info);
+        }
+        true
     }
 
     fn pick_folder(&self) {
@@ -2178,6 +2726,9 @@ impl App {
     }
 
     fn go_history(&self, back: bool) {
+        if self.editor.borrow().is_some() && !self.end_edit() {
+            return;
+        }
         let target = {
             let mut h = self.history.borrow_mut();
             if back { h.back.pop() } else { h.fwd.pop() }
@@ -2330,6 +2881,17 @@ impl App {
     }
 
     fn open_file(&self, path: PathBuf, kind: OpenKind) {
+        // 다른 파일을 편집 중이면 먼저 끝낸다(저장 확인). 취소하면 열지 않는다
+        if kind != OpenKind::Reload {
+            let editing = self.editor.borrow().as_ref().map(|e| e.path.clone());
+            if let Some(ep) = editing
+                && !same_path(&ep, &path)
+                && !self.end_edit()
+            {
+                self.reveal_in_tree(&ep);
+                return;
+            }
+        }
         if kind == OpenKind::Navigate
             && let Some(cur) = self.current_pos()
             && !same_path(&cur.path, &path)
@@ -2763,6 +3325,8 @@ impl App {
         self.doc_stamp.set(file_stamp(&path));
         self.session.borrow_mut().open_file = Some(path);
         self.update_watch();
+        // 편집 중엔 뒤에서 다시 읽은 보기 대신 편집 상태를 보인다
+        self.update_edit_status();
     }
 
     fn take_loading(&self, generation: u64) -> Option<(PathBuf, Instant)> {
@@ -3790,7 +4354,7 @@ extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
             }
             WM_SETFOCUS => {
                 let _ = SetFocus(Some(if app.sidebar_hidden.get() {
-                    app.doc
+                    app.doc_focus()
                 } else {
                     app.current_list().hwnd
                 }));
@@ -3894,6 +4458,29 @@ extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
                 }
                 LRESULT(1)
             }
+            WM_CTLCOLOREDIT => {
+                // 편집기: 문서 배경·글자색
+                let hdc = HDC(wparam.0 as *mut c_void);
+                let p = theme::current();
+                SetTextColor(hdc, theme::colorref(p.text));
+                SetBkColor(hdc, theme::colorref(p.bg));
+                LRESULT(theme::brush(p.bg).0 as isize)
+            }
+            WM_COMMAND if hiword(wparam.0) == EN_CHANGE && lparam.0 != 0 => {
+                app.on_editor_change();
+                LRESULT(0)
+            }
+            WM_APP_NAMING => {
+                let still = app
+                    .naming
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|n| n.edit.0 as usize == wparam.0);
+                if still {
+                    app.finish_naming(true, false);
+                }
+                LRESULT(0)
+            }
             WM_COMMAND if loword(wparam.0) as usize == ID_OPEN_FOLDER => {
                 app.pick_folder();
                 LRESULT(0)
@@ -3927,6 +4514,9 @@ extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
             WM_DPICHANGED => {
                 let dpi = hiword(wparam.0);
                 app.apply_font(dpi);
+                if let Some(e) = app.editor.borrow().as_ref() {
+                    e.set_font(&app.config.borrow().text, dpi);
+                }
                 app.view.borrow_mut().renderer.set_dpi(dpi);
                 let rc = &*(lparam.0 as *const RECT);
                 let _ = SetWindowPos(
@@ -3942,6 +4532,10 @@ extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
                 LRESULT(0)
             }
             WM_CLOSE => {
+                // 편집 중이면 저장 확인. 취소하면 닫지 않는다
+                if !app.end_edit() {
+                    return LRESULT(0);
+                }
                 app.save_session();
                 DefWindowProcW(hwnd, msg, wparam, lparam)
             }
@@ -3963,6 +4557,29 @@ extern "system" fn list_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
     guarded_proc(hwnd, msg, wparam, lparam, |app| {
         let is_files = hwnd == app.files.hwnd;
         let list = if is_files { &app.files } else { &app.outline };
+        // 새 이름 입력칸 (파일 트리의 자식 EDIT)
+        if is_files {
+            match msg {
+                WM_CTLCOLOREDIT => unsafe {
+                    let hdc = HDC(wparam.0 as *mut c_void);
+                    let p = theme::current();
+                    SetTextColor(hdc, theme::colorref(p.text));
+                    SetBkColor(hdc, theme::colorref(p.edit_bg));
+                    return LRESULT(theme::brush(p.edit_bg).0 as isize);
+                },
+                WM_COMMAND if hiword(wparam.0) == EN_KILLFOCUS => unsafe {
+                    // 포커스가 옮겨 가는 도중이라 파괴는 나중에
+                    let _ = PostMessageW(
+                        Some(app.hwnd),
+                        WM_APP_NAMING,
+                        WPARAM(lparam.0 as usize),
+                        LPARAM(0),
+                    );
+                    return LRESULT(0);
+                },
+                _ => {}
+            }
+        }
         let mut events = Vec::new();
         // SetScrollInfo 등으로 재진입하면(이미 빌림) 기본 처리에 맡긴다
         let handled = match (list.st.try_borrow_mut(), app.fonts.try_borrow()) {
@@ -3975,6 +4592,9 @@ extern "system" fn list_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
             } else {
                 app.on_outline_event(ev);
             }
+        }
+        if is_files && matches!(msg, WM_VSCROLL | WM_MOUSEWHEEL | WM_SIZE | WM_KEYDOWN) {
+            app.place_naming_edit();
         }
         handled.unwrap_or_else(|| unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) })
     })
